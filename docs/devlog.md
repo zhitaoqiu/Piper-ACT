@@ -429,3 +429,89 @@ Frame 3000: j2=0.991   j3=-1.447  (另一条 episode)
   2. **不同输入是否产生不同输出**（mean_abs_diff > 0）
 - 如果两个都是 0，说明 VAE 已经坍缩，模型退化成一个固定映射
 - 小数据下优先用确定性模型（`use_vae=false`），数据够多（>100 episodes）再考虑 VAE
+
+---
+
+## 2026-05-11 — 确定性模型仍坍缩 + 数据集不一致诊断 + 重建修复
+
+### 确定性模型（use_vae=false）仍然输出恒定值
+
+**现象**：`use_vae=false`, lr=1e-4 训练 20K 步后（loss=0.222, grad_norm=2.181），诊断发现：
+
+1. **不同输入输出完全相同**：用 4 种完全不同的输入（frame 0、frame 200、全零图像+全零状态、全一图像+全一状态），模型输出完全一致（mean_abs_diff=0.000000）。
+
+2. **Chunk 内 20 步全部平线**：无论哪个输入，20 个时间步的动作完全一样（per-pos variation=0.000000）。
+
+3. **Encoder 输出差异极小**：即使全零 vs 全一这种极端输入，encoder 输出差异仅 ~5e-6。
+
+4. **随机初始化模型同样不敏感**：新鲜 Xavier 初始化的模型，不同输入输出差异也仅 0.001。
+
+**根本原因**：20 episodes / 4971 frames 对 41M 参数、602 token 的 transformer 来说数据量不足。loss 在 200 步（0.269）后就基本停滞，在 0.20-0.27 范围内振荡，模型只是在输出一个"平均最优轨迹"而不是学习输入→输出的映射。
+
+### 数据集裁剪后 metadata 不一致
+
+**问题**：之前用 `scripts/rebuild_trimmed_dataset.py` 的简单版本裁剪死区时，只修改了 parquet 数据行和 info.json 的 total_frames，没有完整重建 episode metadata。导致：
+
+- **20/20 episode** 的 `frame_index` 不从 0 开始（如 Ep 0 从 44 开始）
+- **20/20 episode** 的 `timestamp` 不从 0 开始（如 Ep 0 从 1.467s 开始）
+- **20/20 episode** 的 `dataset_from_index` / `dataset_to_index` 与实际 global index 偏移
+
+这会导致 LeRobot 的 episode 边界检查、视频 timestamp 解码、evaluation 等出现不一致。虽然 action chunk 组装用的是位置索引（不受影响），但这是一个隐藏的数据结构炸弹。
+
+**诊断命令**：
+```python
+import numpy as np, pyarrow.parquet as pq
+data = pq.read_table('data/lerobot_dataset/data/chunk-000/file-000.parquet')
+for ep in sorted(set(data.column('episode_index').to_pylist())):
+    mask = data.column('episode_index').to_pylist() == ep
+    frames = np.array(data.column('frame_index').to_pylist())[mask]
+    ts = np.array(data.column('timestamp').to_pylist())[mask]
+    print(f'Ep {ep}: frame_index_start={frames[0]}, timestamp_start={ts[0]:.3f}s')
+```
+
+### 修复：完整重建数据集
+
+用 LeRobot 官方 API（`create()` + `add_frame()` + `save_episode()` + `finalize()`）逐帧从源数据集读取并写入新数据集，自动生成正确的 metadata、frame_index、timestamp、video chunks。
+
+```bash
+python3 scripts/rebuild_trimmed_dataset.py \
+  --input-root data/lerobot_dataset \
+  --output-root data/lerobot_dataset_rebuilt \
+  --motion-threshold 0.005 \
+  --preroll-frames 5 \
+  --tail-frames 8
+```
+
+结果：
+- 4968 帧（比原 4971 少 3 帧，因为重建过程中重新计算 trim 边界）
+- **0/20 episode** 有问题（全部 frame_index/timestamp/metadata 正确）
+
+### 训练策略调整
+
+1. **chunk_size 降为 10**：`n_action_steps=20` 意味着每 20 步才重新预测一次，开环周期太长（~0.67s at 30fps）。降到 10 后更短的开环窗口，模型更容易适应。
+
+2. **学习率提高**：`optimizer_lr` 从 1e-4 提高到 5e-4，`optimizer_lr_backbone` 从 1e-5 提高到 1e-4（10 倍），解决 backbone 几乎不更新的问题。
+
+3. **训练步数增加**：从 20K 到 50K，每 10K 保存 checkpoint。
+
+4. **部署时 replan-every-step**：绕过 ACT 的 action queue，每一步都重新预测完整 chunk 并只取第一步，避免开环积累误差。
+
+### 新脚本总览
+
+| 脚本 | 功能 |
+|---|---|
+| `scripts/rebuild_trimmed_dataset.py` | 重建裁剪后的 LeRobot dataset（完整 API） |
+| `scripts/analyze_dataset_motion.py` | 诊断数据集运动/静止段/跳跃/对齐 |
+| `scripts/eval_all_checkpoints.py` | 批量评估所有 checkpoint 的 MSE |
+| `scripts/plot_policy_rollout_on_dataset.py` | 在数据集上绘制 policy rollout 对比 |
+| `training/train_act_chunk10.sh` | chunk=10, use_vae=false, lr=5e-4 |
+| `training/train_act_chunk20.sh` | chunk=20, use_vae=false, lr=5e-4 |
+| `training/train_act_chunk40.sh` | chunk=40, use_vae=false, lr=5e-4 |
+
+### 当前遗留风险
+
+1. **数据量核心瓶颈**：即使修好数据集、调优超参，20 episodes / ~5000 frames 对 ACT 来说仍然偏少。更高的 lr 和更多步数可能让模型学习到一些输入→输出映射，但不能保证泛化。理想情况需要 50-100 episodes。
+
+2. **chunk=10 vs chunk=20 取捨**：chunk=10 开环短、更稳定，但预测视野更短；chunk=20 能规划更长轨迹但更容易漂移。需要用实际部署效果来判断。
+
+3. **部署安全**：首次部署新模型时先用 `--dry-run` + `--debug-actions --debug-every 1` 验证，确认 target_diff_from_last_target 在变化后再真机运行。
