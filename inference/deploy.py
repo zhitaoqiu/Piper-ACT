@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Deploy trained ACT policy on Piper arm for bottle grasping.
+Deploy trained ACT or Hybrid policy on Piper arm for bottle grasping.
 
 Usage:
   conda activate piper_act
-  # Test mode A (approach only):
+  # ACT policy (baseline fixed position):
   python3 inference/deploy.py \
-    --checkpt outputs/train/piper_bottle_approach_tiny_1ep/checkpoints/003000/pretrained_model \
+    --checkpt outputs/baselines/baseline_v1_tiny_act_fixed_position_6of6/pretrained_model \
     --test-mode A --debug-actions --replan-every-step
-  # Test mode B (approach + close + lift):
+
+  # Hybrid state-conditioned policy (multi-position):
   python3 inference/deploy.py \
-    --checkpt outputs/train/piper_bottle_approach_tiny_1ep/checkpoints/003000/pretrained_model \
-    --test-mode B --debug-actions --replan-every-step
+    --policy-type hybrid \
+    --hybrid-checkpt outputs/train/hybrid_state_cond_14ep.pt \
+    --test-mode A --debug-actions --debug-policy-io
 
 Controls:
   SPACE  = run one approach attempt
@@ -33,6 +35,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from hardware.piper_wrapper import PiperRobot
 from hardware.config_piper import PiperRobotConfig
 from camera.rs_camera import RealSenseCamera, USBCamera, find_realsense_devices
+from policies.state_conditioned_policy import StateConditionedPolicy
+from policies.state_conditioned_policy_v3 import StateConditionedPolicyV3
+from policies.hybrid_delta_policy import HybridDeltaPolicy
 
 PIPER_GRIPPER_MAX_M = 0.101
 
@@ -48,6 +53,14 @@ READY_J2 = 1.50              # J2 threshold for ready_count
 READY_COUNT_MIN = 5          # consecutive steps above READY_J2 to trigger stop
 STAGNATION_STEPS = 20
 STAGNATION_THRESHOLD = 0.0008  # rad — below this for N consecutive steps = stuck
+
+# Norm safety: gripper std in training is ~0.0006 (near-constant), so a 0.02m
+# gripper offset = 33σ in normalized space, causing state MLP to output garbage.
+# Floor the std and clip normalized state to keep model in its operating regime.
+MIN_NORM_STD = 0.01
+NORM_STATE_CLIP = 5.0
+UNNORM_ACTION_J2_MIN = -0.1   # halt if denormalized action[J2] below this
+UNNORM_ACTION_J2_MAX = 1.8    # halt if denormalized action[J2] above this
 
 
 def load_policy_processors(policy, checkpt: str, device: torch.device):
@@ -151,8 +164,16 @@ def interpolate_joint_path(start: np.ndarray, target: np.ndarray,
     return waypoints
 
 
-def select_policy_action(policy, postprocessor, normalized_obs, replan_every_step: bool):
+def select_policy_action(policy, postprocessor, normalized_obs, replan_every_step: bool,
+                         is_hybrid=False):
     """Return (first_action, full_chunk). full_chunk is None when queue-based."""
+    if is_hybrid:
+        # normalized_obs is actually (wrist_img_tensor, state_tensor) for hybrid
+        wrist_img, state_t = normalized_obs
+        with torch.inference_mode():
+            pred = policy(wrist_img.unsqueeze(0), state_t.unsqueeze(0))
+        return pred, pred.squeeze(0).cpu().numpy()
+
     if replan_every_step:
         if hasattr(policy, "predict_action_chunk"):
             action_chunk = policy.predict_action_chunk(normalized_obs)
@@ -167,8 +188,8 @@ def select_policy_action(policy, postprocessor, normalized_obs, replan_every_ste
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpt", type=str, required=True,
-                        help="Path to trained ACT checkpoint")
+    parser.add_argument("--checkpt", type=str, default=None,
+                        help="Path to trained ACT checkpoint dir (required for --policy-type act).")
     parser.add_argument("--can-port", type=str, default="can0")
     parser.add_argument("--velocity-pct", type=int, default=25)
     parser.add_argument("--hz", type=float, default=30.0,
@@ -222,9 +243,44 @@ def main():
                         help="Max gripper value in training data, for OOD warning.")
     parser.add_argument("--no-return-to-start", action="store_true",
                         help="Disable automatic return to start_pose after trajectory.")
+    parser.add_argument("--debug-policy-io", action="store_true",
+                        help="Print policy input/output at every debug-every step: "
+                        "raw robot_state[J2], obs.state[J2], normalized_state[J2], raw_action[J2].")
+    parser.add_argument("--save-rollout", action="store_true",
+                        help="Save rollout frames (image, state, action) to disk for offline analysis.")
+    parser.add_argument("--policy-type", choices=("act", "hybrid", "hybrid-v3", "hybrid-v4-delta"), default="act",
+                        help="Policy architecture: act (default), hybrid, hybrid-v3, or hybrid-v4-delta (lookahead delta).")
+    parser.add_argument("--hybrid-checkpt", type=str, default=None,
+                        help="Path to hybrid policy .pt checkpoint (for --policy-type hybrid).")
+    parser.add_argument("--clamp-delta-j2-nonnegative", action="store_true",
+                        help="[hybrid-v3 only] Clamp image_delta[J2] >= 0 before combining with base_action. "
+                        "Prevents image_delta from cancelling state_head forward push.")
     parser.add_argument("--max-joint-delta", type=float, default=None,
                         help="Override per-joint max delta for all arm joints. 0=disabled. Default uses per-joint limits.")
+    parser.add_argument("--wrist-freeze-j2", type=float, default=1.45,
+                        help="J2 threshold to freeze J4-J6 wrist joints (default: 1.45).")
+    parser.add_argument("--ready-j2", type=float, default=1.50,
+                        help="J2 threshold for ready_count (default: 1.50).")
+    parser.add_argument("--ready-count-min", type=int, default=5,
+                        help="Consecutive steps above READY_J2 to trigger stop (default: 5).")
+    parser.add_argument("--v4-j2-only", action="store_true",
+                        help="[hybrid-v4-delta] Use v4 delta only for J2; other joints from v2 (ver A) or position-hold (ver B).")
+    parser.add_argument("--v4-j2-only-ver", choices=("A", "B"), default="A",
+                        help="Version A: J1/J3/J4/J5/J6 from v2 baseline. Version B: hold current position (default: A).")
+    parser.add_argument("--v2-checkpt", type=str, default="outputs/train/hybrid_v2.pt",
+                        help="Path to hybrid v2 checkpoint for --v4-j2-only --v4-j2-only-ver A.")
     args = parser.parse_args()
+
+    # Apply command-line overrides to shared constants
+    WRIST_FREEZE_J2 = args.wrist_freeze_j2
+    READY_J2 = args.ready_j2
+    READY_COUNT_MIN = args.ready_count_min
+
+    # Validate checkpoint argument
+    if args.policy_type in ("hybrid", "hybrid-v3", "hybrid-v4-delta") and not args.hybrid_checkpt:
+        parser.error("--hybrid-checkpt is required when --policy-type hybrid, hybrid-v3, or hybrid-v4-delta")
+    if args.policy_type == "act" and not args.checkpt:
+        parser.error("--checkpt is required when --policy-type act (default)")
 
     # Build per-dimension scale array: [J1, J2, J3, J4, J5, J6, Grip]
     arm_s = args.arm_scale if args.arm_scale is not None else args.delta_scale
@@ -245,41 +301,167 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Device: {device}")
 
-    # --- Load ACT policy ---
-    print(f"\n[1/4] Loading ACT policy from {args.checkpt} ...")
-    from lerobot.policies.act.modeling_act import ACTPolicy
-    policy = ACTPolicy.from_pretrained(args.checkpt)
-    policy.to(device)
-    policy.eval()
-    chunk_size = policy.config.chunk_size
-    n_action_steps = policy.config.n_action_steps
-    expected_state_dim = policy_state_dim(policy)
-    uses_phase = expected_state_dim == 8
-    print(
-        f"  Policy loaded (chunk_size={chunk_size}, n_action_steps={n_action_steps}, "
-        f"state_dim={expected_state_dim})."
-    )
+    # --- Load policy ---
+    if args.policy_type in ("hybrid", "hybrid-v3", "hybrid-v4-delta"):
+        hybrid_ckpt = args.hybrid_checkpt or "outputs/train/hybrid_state_cond_14ep.pt"
+        print(f"\n[1/4] Loading {args.policy_type} policy from {hybrid_ckpt} ...")
+        ckpt = torch.load(hybrid_ckpt, map_location=device, weights_only=False)
+        model_args = ckpt["args"]
+        is_v4_delta = (args.policy_type == "hybrid-v4-delta")
 
-    # --- Load pre/post processors ---
-    print("\n[2/4] Loading pre/post processors from checkpoint ...")
-    preprocessor, postprocessor = load_policy_processors(policy, args.checkpt, device)
-    print("  Processors ready.")
+        if args.v4_j2_only and not is_v4_delta:
+            parser.error("--v4-j2-only requires --policy-type hybrid-v4-delta")
+
+        if is_v4_delta:
+            policy = HybridDeltaPolicy(
+                state_dim=model_args.get("state_dim", 7),
+                delta_dim=model_args.get("delta_dim", 6),
+                img_feat_dim=model_args.get("img_feat_dim", 256),
+                state_feat_dim=model_args.get("state_feat_dim", 64),
+                state_hidden=model_args.get("state_hidden", 128),
+                action_hidden=model_args.get("action_hidden", 256),
+                use_global_img=model_args.get("use_global_img", False),
+            ).to(device)
+        elif args.policy_type == "hybrid-v3":
+            policy = StateConditionedPolicyV3(
+                state_dim=7, action_dim=7,
+                img_feat_dim=model_args.get("img_feat_dim", 256),
+                state_feat_dim=model_args.get("state_feat_dim", 64),
+                state_hidden=model_args.get("state_hidden", 128),
+                action_hidden=model_args.get("action_hidden", 256),
+                use_global_img=model_args.get("use_global_img", False),
+            ).to(device)
+        else:
+            policy = StateConditionedPolicy(
+                state_dim=7, action_dim=7,
+                img_feat_dim=model_args.get("img_feat_dim", 256),
+                state_feat_dim=model_args.get("state_feat_dim", 128),
+                state_hidden=model_args.get("state_hidden", 128),
+                action_hidden=model_args.get("action_hidden", 256),
+                use_global_img=model_args.get("use_global_img", False),
+            ).to(device)
+        policy.load_state_dict(ckpt["model_state_dict"])
+        policy.eval()
+        hybrid_img_h = model_args.get("img_size", 160)
+        hybrid_img_w = int(hybrid_img_h * 4 / 3)
+        chunk_size = 1
+        n_action_steps = 1
+        expected_state_dim = 7
+        uses_phase = False
+        preprocessor = None
+        postprocessor = None
+        # Load norm stats
+        norm_stats = ckpt.get("norm_stats", None)
+        _v3_internals = None  # initialized here for scoping; set to dict if v3 clamp enabled
+        hybrid_delta_mean = hybrid_delta_std = None  # v4 only
+        if norm_stats:
+            hybrid_state_mean = np.array(norm_stats["state_mean"], dtype=np.float32)
+            hybrid_state_std = np.array(norm_stats["state_std"], dtype=np.float32)
+            hybrid_state_std = np.maximum(hybrid_state_std, MIN_NORM_STD)
+            if is_v4_delta:
+                # V4 uses delta normalization (6D arm delta), not action normalization
+                hybrid_delta_mean = np.array(norm_stats["delta_mean"], dtype=np.float32)
+                hybrid_delta_std = np.array(norm_stats["delta_std"], dtype=np.float32)
+                hybrid_delta_std = np.maximum(hybrid_delta_std, MIN_NORM_STD)
+                hybrid_action_mean = hybrid_action_std = None  # not used by v4
+                k = model_args.get("lookahead_k", "?")
+                extra = f"  K={k}  residual_scale={policy.residual_scale.tolist()}"
+            else:
+                hybrid_action_mean = np.array(norm_stats["action_mean"], dtype=np.float32)
+                hybrid_action_std = np.array(norm_stats["action_std"], dtype=np.float32)
+                hybrid_action_std = np.maximum(hybrid_action_std, MIN_NORM_STD)
+                extra = ""
+                if args.policy_type == "hybrid-v3":
+                    extra = f"  img_gate={ckpt.get('img_gate_final','?'):.2f}  state_gate={ckpt.get('state_gate_final','?'):.2f}"
+            print(f"  Policy loaded: {sum(p.numel() for p in policy.parameters()):,} params  "
+                  f"img_size=({hybrid_img_h},{hybrid_img_w})  "
+                  f"improvement_ratio={ckpt.get('improvement_ratio','?'):.4f}  "
+                  f"norm=on{extra}")
+            # ── V3 delta clamp: register hooks to capture base/delta ──
+            if args.policy_type == "hybrid-v3" and args.clamp_delta_j2_nonnegative:
+                _v3_internals = {}
+                policy.state_head.register_forward_hook(
+                    lambda m, inp, out: _v3_internals.update(base_norm=out.detach()))
+                policy.image_delta_head.register_forward_hook(
+                    lambda m, inp, out: _v3_internals.update(delta_norm=out.detach()))
+                print(f"  V3 delta clamp: ON (image_delta[J2] >= 0 in normalized space)")
+            else:
+                _v3_internals = None
+
+            # ── v4-j2-only: load v2 model for non-J2 joints ──
+            v2_model = None
+            v2_action_mean = v2_action_std = None
+            if is_v4_delta and args.v4_j2_only and args.v4_j2_only_ver == "A":
+                v2_ckpt_path = args.v2_checkpt
+                print(f"  [v4-j2-only Ver A] Loading v2 baseline from {v2_ckpt_path} ...")
+                v2_ckpt = torch.load(v2_ckpt_path, map_location=device, weights_only=False)
+                v2_args = v2_ckpt["args"]
+                v2_model = StateConditionedPolicy(
+                    state_dim=7, action_dim=7,
+                    img_feat_dim=v2_args.get("img_feat_dim", 256),
+                    state_feat_dim=v2_args.get("state_feat_dim", 128),
+                    state_hidden=v2_args.get("state_hidden", 128),
+                    action_hidden=v2_args.get("action_hidden", 256),
+                    use_global_img=v2_args.get("use_global_img", False),
+                ).to(device)
+                v2_model.load_state_dict(v2_ckpt["model_state_dict"])
+                v2_model.eval()
+                v2_ns = v2_ckpt.get("norm_stats", {})
+                if v2_ns:
+                    v2_action_mean = np.array(v2_ns["action_mean"], dtype=np.float32)
+                    v2_action_std = np.maximum(np.array(v2_ns["action_std"], dtype=np.float32), MIN_NORM_STD)
+                print(f"  V2 baseline loaded: {sum(p.numel() for p in v2_model.parameters()):,} params"
+                      f"  improvement_ratio={v2_ckpt.get('improvement_ratio','?'):.4f}")
+        else:
+            hybrid_state_mean = hybrid_state_std = None
+            hybrid_action_mean = hybrid_action_std = None
+            print(f"  Policy loaded: {sum(p.numel() for p in policy.parameters()):,} params  "
+                  f"img_size=({hybrid_img_h},{hybrid_img_w})  "
+                  f"improvement_ratio={ckpt.get('improvement_ratio','?'):.4f}  "
+                  f"norm=off")
+    else:
+        print(f"\n[1/4] Loading ACT policy from {args.checkpt} ...")
+        from lerobot.policies.act.modeling_act import ACTPolicy
+        policy = ACTPolicy.from_pretrained(args.checkpt)
+        policy.to(device)
+        policy.eval()
+        chunk_size = policy.config.chunk_size
+        n_action_steps = policy.config.n_action_steps
+        expected_state_dim = policy_state_dim(policy)
+        uses_phase = expected_state_dim == 8
+        hybrid_img_h = None
+        hybrid_img_w = None
+        print(
+            f"  Policy loaded (chunk_size={chunk_size}, n_action_steps={n_action_steps}, "
+            f"state_dim={expected_state_dim})."
+        )
+
+        # --- Load pre/post processors ---
+        print("\n[2/4] Loading pre/post processors from checkpoint ...")
+        preprocessor, postprocessor = load_policy_processors(policy, args.checkpt, device)
+        print("  Processors ready.")
 
     # --- Connect robot ---
-    print(f"\n[3/4] Connecting Piper ({args.can_port}) ...")
+    step_n = 2 if args.policy_type in ("hybrid", "hybrid-v3") else 3
+    total_n = 3 if args.policy_type in ("hybrid", "hybrid-v3") else 4
+    print(f"\n[{step_n}/{total_n}] Connecting Piper ({args.can_port}) ...")
     robot = PiperRobot(can_port=args.can_port, disable_torque_on_disconnect=False)
     robot.connect()  # connect + enable in one call
     print("  Robot connected and enabled (disable_torque_on_disconnect=False).")
 
     # --- Init cameras ---
-    print("\n[4/4] Initializing cameras ...")
+    step_n += 1
+    print(f"\n[{step_n}/{total_n}] Initializing cameras ...")
     rs_serials = find_realsense_devices()
     wrist_serial = rs_serials[0] if rs_serials else ""
     wrist_cam = RealSenseCamera(serial=wrist_serial, width=640, height=480, fps=30,
                                 enable_depth=False)
 
     global_cam = None
-    requires_global = "observation.images.global_rgb" in policy.config.input_features
+    if args.policy_type in ("hybrid", "hybrid-v3", "hybrid-v4-delta"):
+        requires_global = False
+    else:
+        requires_global = "observation.images.global_rgb" in policy.config.input_features
     if args.no_global and requires_global:
         raise ValueError("This policy was trained with global_rgb, so --no-global cannot be used.")
     if not args.no_global:
@@ -323,6 +505,10 @@ def main():
         print("  DRY RUN: robot commands will not be sent.")
     if args.replan_every_step:
         print("  REPLAN: policy will predict a fresh first action at every step.")
+    if args.v4_j2_only:
+        ver_label = "v2 baseline" if args.v4_j2_only_ver == "A" else "position-hold"
+        print(f"  [v4-j2-only Ver {args.v4_j2_only_ver}] J2 from v4 delta, "
+              f"J1/J3/J4/J5/J6 from {ver_label}.")
     print("-" * 60 + "\n")
 
     try:
@@ -350,13 +536,23 @@ def main():
             # ================================================================
             print(f"  >>> Approach attempt (test-mode={args.test_mode}, {args.approach_steps} steps) ...")
 
+            # Setup rollout saving directory
+            rollout_dir = None
+            if args.save_rollout:
+                import datetime
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                rollout_dir = Path(PROJECT_ROOT) / "logs" / "rollouts" / f"test_a_{ts}"
+                rollout_dir.mkdir(parents=True, exist_ok=True)
+                print(f"  Saving rollout to {rollout_dir}")
+
             # Save start position for auto return
             start_robot_state = np.asarray(robot.get_joint_positions(), dtype=np.float32)
 
             # Reset action queue before new trajectory
-            policy.reset()
-            preprocessor.reset()
-            postprocessor.reset()
+            if args.policy_type == "act":
+                policy.reset()
+                preprocessor.reset()
+                postprocessor.reset()
 
             approach_steps = args.approach_steps
             last_smoothed = None
@@ -380,23 +576,196 @@ def main():
                 # Build observation
                 wrist_img = wrist_frame.rgb
                 global_img = global_frame.rgb if global_frame else None
-                obs = prepare_observation(
-                    robot_state, wrist_img, global_img, device, expected_state_dim, phase,
-                    gripper_unit_scale=args.gripper_unit_scale,
-                )
 
-                # Run inference
-                with torch.inference_mode():
-                    normalized_obs = preprocessor(obs)
-                    action, _ = select_policy_action(
-                        policy, postprocessor, normalized_obs, args.replan_every_step
+                if args.policy_type in ("hybrid", "hybrid-v3", "hybrid-v4-delta"):
+                    import torchvision.transforms.functional as TF
+                    # ── Stage 0: prepare image ──
+                    img_t = torch.from_numpy(wrist_img).float() / 255.0
+                    img_t = img_t.permute(2, 0, 1)  # (C, H, W)
+                    img_t = TF.resize(img_t, (hybrid_img_h, hybrid_img_w), antialias=True)
+                    img_t = img_t.to(device)
+
+                    # ── Stage 1: capture raw robot state ──
+                    robot_state_arr_hy = np.asarray(robot_state, dtype=np.float32)
+
+                    # ── Stage 2: normalize state ──
+                    if hybrid_state_mean is not None:
+                        state_norm = (robot_state_arr_hy - hybrid_state_mean) / hybrid_state_std
+                        state_norm = np.clip(state_norm, -NORM_STATE_CLIP, NORM_STATE_CLIP)
+                    else:
+                        state_norm = robot_state_arr_hy.copy()
+                    state_t = torch.from_numpy(state_norm).float().to(device)
+
+                    # ── Stage 3: model inference ──
+                    with torch.inference_mode():
+                        action, _ = select_policy_action(
+                            policy, None, (img_t, state_t), True, is_hybrid=True
+                        )
+                    model_output_norm = action.squeeze(0).cpu().numpy() if action.dim() == 2 else action.cpu().numpy()
+
+                    # ── Stage 3b (v3 only): clamp image_delta[J2] >= 0 ──
+                    v3_base_norm = None
+                    v3_delta_norm_raw = None
+                    if _v3_internals is not None:
+                        v3_base_norm = _v3_internals["base_norm"].squeeze(0).cpu().numpy().copy()
+                        v3_delta_norm_raw = _v3_internals["delta_norm"].squeeze(0).cpu().numpy().copy()
+                        v3_delta_norm_clamped = v3_delta_norm_raw.copy()
+                        if v3_delta_norm_clamped[1] < 0.0:
+                            v3_delta_norm_clamped[1] = 0.0
+                        final_norm_clamped = v3_base_norm + v3_delta_norm_clamped
+                        model_output_norm_before = model_output_norm.copy()
+                        model_output_norm = final_norm_clamped
+
+                    # ── Stage 4: denormalize ──
+                    base_robot_j2 = delta_robot_raw_j2 = delta_robot_clamped_j2 = None
+                    final_before_robot_j2 = final_after_robot_j2 = None
+                    v4_delta_robot = None
+                    v4_base_delta_robot = None
+                    v4_img_res_robot = None
+                    if is_v4_delta:
+                        # V4: output is 6D normalized delta
+                        v4_delta_robot = model_output_norm * hybrid_delta_std + hybrid_delta_mean
+                        model_action = np.zeros(7, dtype=np.float32)
+
+                        if args.v4_j2_only:
+                            # ── v4-j2-only: only J2 from v4 delta ──
+                            model_action[1] = robot_state_arr_hy[1] + v4_delta_robot[1]
+                            if args.v4_j2_only_ver == "A":
+                                # Version A: J1/J3/J4/J5/J6 from v2 baseline
+                                with torch.inference_mode():
+                                    v2_out_norm = v2_model(img_t.unsqueeze(0), state_t.unsqueeze(0))
+                                v2_out = v2_out_norm.squeeze(0).cpu().numpy() * v2_action_std + v2_action_mean
+                                model_action[0] = v2_out[0]   # J1
+                                model_action[2] = v2_out[2]   # J3
+                                model_action[3] = v2_out[3]   # J4
+                                model_action[4] = v2_out[4]   # J5
+                                model_action[5] = v2_out[5]   # J6
+                            else:
+                                # Version B: J1/J3/J4/J5/J6 hold current position
+                                model_action[0] = robot_state_arr_hy[0]   # J1
+                                model_action[2] = robot_state_arr_hy[2]   # J3
+                                model_action[3] = robot_state_arr_hy[3]   # J4
+                                model_action[4] = robot_state_arr_hy[4]   # J5
+                                model_action[5] = robot_state_arr_hy[5]   # J6
+                            model_action[6] = GRIPPER_OPEN
+                        else:
+                            # Standard v4: all 6 arm joints from delta
+                            model_action[:6] = robot_state_arr_hy[:6] + v4_delta_robot
+                            model_action[6] = GRIPPER_OPEN
+
+                        if args.debug_policy_io and (
+                            step == 0 or step == approach_steps - 1 or (step + 1) % args.debug_every == 0
+                        ):
+                            # Get decomposition for logging
+                            with torch.inference_mode():
+                                _, base_d, img_r = policy.forward_with_internals(
+                                    img_t.unsqueeze(0), state_t.unsqueeze(0))
+                            v4_base_delta_robot = base_d.squeeze(0).cpu().numpy() * hybrid_delta_std + hybrid_delta_mean
+                            v4_img_res_robot = img_r.squeeze(0).cpu().numpy() * hybrid_delta_std + hybrid_delta_mean
+                    elif hybrid_action_mean is not None:
+                        model_action = model_output_norm * hybrid_action_std + hybrid_action_mean
+                        if v3_base_norm is not None:
+                            base_robot_j2 = float(v3_base_norm[1] * hybrid_action_std[1])
+                            delta_robot_raw_j2 = float(v3_delta_norm_raw[1] * hybrid_action_std[1])
+                            delta_robot_clamped_j2 = float(v3_delta_norm_clamped[1] * hybrid_action_std[1])
+                            final_before_robot_j2 = float(model_output_norm_before[1] * hybrid_action_std[1] + hybrid_action_mean[1])
+                            final_after_robot_j2 = float(model_action[1])
+                    else:
+                        model_action = model_output_norm
+                    raw_actions.append(model_action.copy())
+
+                    # ── Stage 5: sanity check ──
+                    action_j2 = float(model_action[1])
+                    if is_v4_delta:
+                        # V4 sanity: check target J2 and delta J2
+                        delta_j2 = float(v4_delta_robot[1])
+                        if model_action[1] < robot_state_arr_hy[1] - 0.02:
+                            print(f"\n  [HALT] v4 target[J2]={model_action[1]:.4f} < current_J2={robot_state_arr_hy[1]:.4f} - 0.02")
+                            print(f"    pred_delta[J2] = {delta_j2:.4f}")
+                            stop_reason = "action_sanity"
+                            break
+                        if model_action[1] > 1.8:
+                            print(f"\n  [HALT] v4 target[J2]={model_action[1]:.4f} > 1.8")
+                            print(f"    pred_delta[J2] = {delta_j2:.4f}")
+                            stop_reason = "action_sanity"
+                            break
+                        if robot_state_arr_hy[1] < READY_J2 and delta_j2 < -0.01:
+                            print(f"\n  [WARN] v4 pred_delta[J2]={delta_j2:.4f} < -0.01 while J2 < READY_J2 — unexpected negative delta")
+                    elif action_j2 < UNNORM_ACTION_J2_MIN or action_j2 > UNNORM_ACTION_J2_MAX:
+                        print(f"\n  [HALT] action_after_unnorm[J2]={action_j2:.4f} "
+                              f"outside safe range [{UNNORM_ACTION_J2_MIN}, {UNNORM_ACTION_J2_MAX}]")
+                        print(f"    model_output_norm[J2] = {model_output_norm[1]:.4f}")
+                        print(f"    robot_state[J2] = {robot_state_arr_hy[1]:.4f}")
+                        print(f"    state_norm[J2]  = {state_norm[1]:.4f}")
+                        if v3_base_norm is not None:
+                            print(f"    base_action[J2]        = {base_robot_j2:.4f}")
+                            print(f"    raw_image_delta[J2]    = {delta_robot_raw_j2:.4f}")
+                            print(f"    clamped_image_delta[J2]= {delta_robot_clamped_j2:.4f}")
+                        print(f"    This indicates the model is extrapolating wildly (OOD input).")
+                        print(f"    Check: gripper, camera, or robot starting pose.")
+                        stop_reason = "action_sanity"
+                        break
+
+                    # ── Policy I/O debug for hybrid ──
+                    if args.debug_policy_io and (
+                        step == 0 or step == approach_steps - 1 or (step + 1) % args.debug_every == 0
+                    ):
+                        print(f"  [POLICY-IO] step={step+1:03d}/{approach_steps}")
+                        print(f"    robot_state  (raw)     = {fmt_vec(robot_state_arr_hy)}")
+                        print(f"    state_norm   (model in)= {fmt_vec(state_norm)}")
+                        print(f"    model_output (norm)    = {fmt_vec(model_output_norm)}")
+                        if is_v4_delta:
+                            print(f"    pred_delta   (robot)   = {fmt_vec(v4_delta_robot)}")
+                            if v4_base_delta_robot is not None:
+                                print(f"    base_delta[J2]         = {v4_base_delta_robot[1]:.4f}")
+                                print(f"    img_residual[J2]       = {v4_img_res_robot[1]:.4f}")
+                            if args.v4_j2_only:
+                                print(f"    target_arm   (robot)   = {fmt_vec(model_action[:6])}  [v4-j2-only ver {args.v4_j2_only_ver}]")
+                                print(f"    J2 from v4 delta, J1/J3/J4/J5/J6 from {'v2' if args.v4_j2_only_ver == 'A' else 'position-hold'}")
+                            else:
+                                print(f"    target_arm   (robot)   = {fmt_vec(model_action[:6])}")
+                            print(f"    target_grip  (forced)  = {model_action[6]:.3f}")
+                            print(f"    current_qpos[J2]       = {robot_state_arr_hy[1]:.4f}")
+                        else:
+                            print(f"    action_unnorm(robot)   = {fmt_vec(model_action)}")
+                            if v3_base_norm is not None:
+                                print(f"    base_action[J2]        = {base_robot_j2:.4f}")
+                                print(f"    raw_image_delta[J2]    = {delta_robot_raw_j2:.4f}")
+                                print(f"    clamped_image_delta[J2]= {delta_robot_clamped_j2:.4f}")
+                                print(f"    final_before_clamp[J2] = {final_before_robot_j2:.4f}")
+                                print(f"    final_after_clamp[J2]  = {final_after_robot_j2:.4f}")
+                                print(f"    current_qpos[J2]       = {robot_state_arr_hy[1]:.4f}")
+                else:
+                    obs = prepare_observation(
+                        robot_state, wrist_img, global_img, device, expected_state_dim, phase,
+                        gripper_unit_scale=args.gripper_unit_scale,
                     )
 
-                # action shape: (1, 7) -> (7,)
-                if action.dim() == 2:
-                    action = action.squeeze(0)
-                model_action = action.cpu().numpy()
-                raw_actions.append(model_action.copy())
+                    # Run inference
+                    with torch.inference_mode():
+                        normalized_obs = preprocessor(obs)
+                        action, _ = select_policy_action(
+                            policy, postprocessor, normalized_obs, args.replan_every_step
+                        )
+
+                    # action shape: (1, 7) -> (7,)
+                    if action.dim() == 2:
+                        action = action.squeeze(0)
+                    model_action = action.cpu().numpy()
+                    raw_actions.append(model_action.copy())
+
+                    # ── Policy I/O debug for ACT ──
+                    if args.debug_policy_io and (
+                        step == 0 or step == approach_steps - 1 or (step + 1) % args.debug_every == 0
+                    ):
+                        nstate = normalized_obs["observation.state"].squeeze(0).cpu().numpy()
+                        raw_obs_state = obs["observation.state"].squeeze(0).cpu().numpy()
+                        robot_state_arr_tmp = np.asarray(robot_state, dtype=np.float32)
+                        print(f"  [POLICY-IO] step={step+1:03d}/{approach_steps}")
+                        print(f"    robot_state  (raw)     = {fmt_vec(robot_state_arr_tmp)}")
+                        print(f"    obs.state    (raw)     = {fmt_vec(raw_obs_state)}")
+                        print(f"    state_norm   (model in)= {fmt_vec(nstate)}")
+                        print(f"    model_action (robot)   = {fmt_vec(model_action)}")
 
                 robot_state_arr = np.asarray(robot_state, dtype=np.float32)
 
@@ -438,8 +807,8 @@ def main():
                 sent_target[:6] = np.clip(sent_target[:6], -3.14, 3.14)
                 sent_target[6] = np.clip(sent_target[6], 0.0, PIPER_GRIPPER_MAX_M)
 
-                # ── Ready stop: J2 > READY_J2 for READY_COUNT_MIN consecutive steps ──
-                if robot_state_arr[1] > READY_J2 and step > 150:
+                # ── Ready stop: J2 > READY_J2 for READY_COUNT_MIN consecutive steps after step 160 ──
+                if robot_state_arr[1] > READY_J2 and step > 160:
                     ready_count += 1
                 else:
                     ready_count = 0
@@ -496,6 +865,20 @@ def main():
                     print(f"\n  [STOP] Approach complete ({stop_reason})"
                           f"  J2={robot_state_arr[1]:.4f}  step={step+1}")
                     break
+
+                # ── Save rollout data ──
+                if rollout_dir is not None and (step % 5 == 0 or step < 5 or step >= approach_steps - 5):
+                    np.savez_compressed(
+                        rollout_dir / f"step_{step:04d}.npz",
+                        robot_state=robot_state_arr.copy(),
+                        raw_action=raw_target.copy(),
+                        sent_target=sent_target.copy(),
+                        step=step,
+                    )
+                    # Save wrist image every 20 steps (to save disk)
+                    if step % 20 == 0:
+                        cv2.imwrite(str(rollout_dir / f"wrist_{step:04d}.jpg"),
+                                    cv2.cvtColor(wrist_frame.rgb, cv2.COLOR_RGB2BGR))
 
                 # ── Send to robot ──
                 if not args.dry_run:
