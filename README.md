@@ -158,6 +158,8 @@ python3 inference/deploy.py \
 
 完整数据诊断、重建式裁剪、chunk size 对照训练和 checkpoint 批量评估命令见 [docs/act_debugging.md](docs/act_debugging.md)。
 
+如果离线检查发现策略输出固定姿势，优先走 [delta action + phase input](docs/act_debugging.md#35-修复坍缩delta-action--phase-input) 流程；这类 checkpoint 部署时要加 `--action-mode delta`。
+
 ## 已知问题与修复
 
 ### 1. lerobot 源码 patch
@@ -209,7 +211,7 @@ SN0002 摄像头在某些系统上 V4L2 打开失败。已实现自动扫描 `/d
 | `set_joint_positions(pos, velocity_pct)` | — | 下发关节指令 |
 | `disconnect()` | — | 断开 CAN 连接 |
 
-底层基于 `piper_sdk.C_PiperInterface`，关节角单位 rad，夹爪单位 m。安全限位 ±3.14 rad，夹爪范围 0~0.035 m。
+底层基于 `piper_sdk.C_PiperInterface`，关节角单位 rad，夹爪单位 m。安全限位 ±3.14 rad，夹爪范围 0~0.10 m。
 
 ## 眼镜哥接手注意事项
 

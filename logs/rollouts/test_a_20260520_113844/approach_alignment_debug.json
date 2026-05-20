@@ -1,0 +1,34 @@
+{
+  "final_step": 200,
+  "stop_reason": "max_steps",
+  "final_qpos": [
+    -0.4096897840499878,
+    1.4875894784927368,
+    -0.7164599895477295,
+    -0.050186388194561005,
+    0.14874498546123505,
+    0.04477874934673309,
+    0.09860000014305115
+  ],
+  "final_gripper": 0.09860000014305115,
+  "final_chunk_id": 2,
+  "final_chunk_idx": 17,
+  "final_target": [
+    -0.4099942147731781,
+    1.4933230876922607,
+    -0.7155320644378662,
+    -0.050186485052108765,
+    0.1487451195716858,
+    0.044778648763895035,
+    0.09950000047683716
+  ],
+  "final_arm_error": 0.006106376647949219,
+  "final_ready_count": 0,
+  "close_detected": false,
+  "release_detected": false,
+  "gripper_phase": "open",
+  "rollout_dir": "/home/huatec/piper_act_bottle_grasp/logs/rollouts/test_a_20260520_113844",
+  "joint_ready": false,
+  "visual_alignment_required": true,
+  "user_note": ""
+}

@@ -125,6 +125,7 @@ python3 inference/deploy.py \
 | ACT approach-only | 视觉引导的 approach 阶段，替代固定的 pre_grasp 和 approach waypoints | 待采集数据 |
 | 代码 close/lift/place/release/retreat/home | 规则驱动的后续阶段 | ✅ 已实现 |
 
+
 ## 实施步骤
 
 ### 步骤 1：确认 waypoints baseline 稳定

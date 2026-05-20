@@ -118,7 +118,8 @@ class RealSenseCamera:
             frames = self._align.process(frames)
 
         color_frame = frames.get_color_frame()
-        rgb = np.asanyarray(color_frame.get_data())  # BGR from camera
+        bgr = np.asanyarray(color_frame.get_data())
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         depth = None
         if self.enable_depth:
@@ -280,7 +281,8 @@ class USBCamera:
         ret, frame = self.cap.read()
         if not ret:
             raise IOError(f"USB camera {self.device_id} read failed")
-        return CameraFrame(rgb=frame, depth=None, timestamp=time.time())
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return CameraFrame(rgb=rgb, depth=None, timestamp=time.time())
 
     def close(self) -> None:
         if self.cap is not None:

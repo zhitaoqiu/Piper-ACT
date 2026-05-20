@@ -750,7 +750,7 @@ J2 > 1.50 连续 5 步 → 自动停止 (自适应到点，不需要预知步数
 - conda activate piper_act && python3 inference/deploy.py \
     --checkpt outputs/train/piper_bottle_approach_tiny_1ep/checkpoints/003000/pretrained_model \
     --test-mode D --debug-actions --replan-every-step
-W
+
 
 ### 关键经验总结
 
@@ -761,3 +761,74 @@ W
 5. **平滑参数参与 closed-loop 反馈**：不能只看消抖效果
 6. **wrist 终点冻结是低成本防抖**：利用大臂已经到位的先验，不依赖模型 wrist 预测
 7. **ready stop 比固定步数更可靠**：自适应到点，防止模型在边界处超调和振荡
+
+### 成功率验证（2026-05-14，Test D ×6）
+
+| 轮次 | J2 终点 | 步数 | 抓起 | 放置 | 回原点 |
+|------|---------|------|:---:|:---:|:---:|
+| 1 | 1.5403 | 179 | ✓ | ✓ | ✓ |
+| 2 | 1.5415 | 174 | ✓ | ✓ | ✓ |
+| 3 | 1.5422 | 174 | ✓ | ✓ | ✓ |
+| 4 | 1.5392 | 176 | ✓ | ✓ | ✓ |
+| 5 | 1.5389 | 179 | ✓ | ✓ | ✓ |
+| 6 | 1.5441 | 178 | ✓ | ✓ | ✓ |
+
+**成功率 6/6 = 100%**。J2 终点均值 1.5410 ± 0.003 rad，步数 174-179，ready stop 稳定触发。
+Tiny ACT (11M, 1 episode, chunk_size=1) 在 approach-only 单场景下的部署可靠性已验证。
+
+## 2026-05-15 — 多位置泛化失败 + 诊断 + Hybrid Policy
+
+### Tiny ACT 14ep 坍缩诊断
+
+**现象**: 10K checkpoint 真机 Test A 输出常数 `raw_action=[0.019, 0.141, -0.113, -0.044, 0.130, 0.008, 0.100]`，
+机器人 stagnation @ J2=0.14。
+
+**离线诊断** (scripts/diag_collapse.py):
+- Baseline 1ep ACT: per-ep pred_J2_std=0.524, improvement_ratio=0.0046, **但 sensitivity=0.000000**
+
+  J2 +0.5 rad → Δpred_J2=0. Baseline 虽然 6/6 成功，却完全忽略 state 输入，只靠 wrist 图像时序记住单条轨迹。
+
+- 10K 14ep ACT: per-ep pred_J2_std=0.55~0.63 (看起来正常), improvement_ratio=0.249,
+  **但 ALL 14 episodes 输出近乎相同的轨迹** (pred_J2 0.1409→1.4274, 每个 episode 完全一样)。
+  sensitivity=0.000000, 不同 episode 图片→Δpred=0.000004。
+
+**根因**: Tiny ACT (128-dim, 4-head, 2-layer cross-attention) 没有学会 state→action 映射。
+Decoder 忽略 cross-attention (来自 encoder 的 state+image 特征)，输出接近均值。
+这是 cross-attention collapse，不是数据质量/训练步数/学习率问题。
+
+### Step 1: qpos-only MLP 验证数据可学性
+
+`scripts/train_qpos_mlp_14ep.py`:
+- 结构: 7→128→128→128→7, 18K 参数, 5000 steps, batch=64, lr=1e-3
+- 结果: improvement_ratio=0.00045 (arm), J2+0.5→Δpred_J2=+0.46, cross-ep spread=0.058
+- **结论: 14ep 的 state→action 映射非常强，数据完全没问题。是 ACT 结构没有利用 state。**
+
+### Step 2: State-Conditioned Hybrid Policy
+
+`policies/state_conditioned_policy.py`:
+- 设计: image_encoder(CNN) + state_mlp → concat → action_head
+- 显式 state-conditioned，不用 cross-attention，不让 decoder learned query 单独生成 action
+- 608K 参数, 训练 5000 steps, batch=32, lr=1e-3, 61 秒完成
+
+离线评估结果:
+
+| 指标 | Hybrid | MLP-only | ACT 10K | ACT baseline |
+|---|---|---|---|---|
+| improvement_ratio | 0.0030 | 0.0005 | 0.2493 | 0.0046 |
+| sensitivity J2+0.5 | +0.338 | +0.460 | 0.000 | 0.000 |
+| cross-ep spread | 0.056 | 0.058 | ~0 | N/A |
+| image sensitivity | small | N/A | ~0 | N/A |
+
+部署: [deploy.py](inference/deploy.py) 已添加 `--policy-type hybrid --hybrid-checkpt` 支持。
+所有控制工程 (per-joint clamp, EMA, wrist freeze, ready stop, stagnation) 保持不变。
+
+### 下一步
+
+等待真机 Test A smoke test (hybrid model)。部署命令:
+```bash
+python3 inference/deploy.py \
+  --policy-type hybrid \
+  --hybrid-checkpt outputs/train/hybrid_state_cond_14ep.pt \
+  --test-mode A --debug-actions --debug-policy-io
+```
+

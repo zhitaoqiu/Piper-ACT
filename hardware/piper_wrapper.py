@@ -1,5 +1,5 @@
 """PiperRobot — LeRobot-standard Robot implementation for Piper robotic arm."""
-
+# 硬件适配层 调用piper_sdk来封装接口适配lerobot平台
 import logging
 import sys
 import time

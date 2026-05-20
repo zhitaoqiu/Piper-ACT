@@ -1,0 +1,63 @@
+digraph ACTPolicy {
+    rankdir=LR
+    fontname="Noto Sans CJK SC"
+    fontsize=20
+    label="ACT Policy 内部结构"
+    labelloc=t
+    newrank=true
+    nodesep=0.5
+    ranksep=0.8
+
+    node [fontname="Noto Sans CJK SC" fontsize=12 style="rounded,filled" penwidth=1.5 shape=box]
+
+    subgraph cluster_policy {
+        label="ACT Policy"
+        fontname="Noto Sans CJK SC"
+        fontsize=16
+        style="rounded,solid"
+        color="#2C3E50"
+        bgcolor="#F8F9F9"
+        penwidth=2
+
+        subgraph cluster_eyes {
+            label="ResNet18（眼睛）"
+            fontname="Noto Sans CJK SC"
+            fontsize=13
+            style="rounded,dashed"
+            color="#2980B9"
+            bgcolor="#EBF5FB"
+            penwidth=2
+
+            RESNET [label="ResNet18\n(ImageNet 预训练)\n\n480×640 RGB → 特征向量" fillcolor="#85C1E9" color="#2980B9"]
+        }
+
+        subgraph cluster_brain {
+            label="Transformer（大脑）"
+            fontname="Noto Sans CJK SC"
+            fontsize=13
+            style="rounded,dashed"
+            color="#8E44AD"
+            bgcolor="#F4ECF7"
+            penwidth=2
+
+            TF [label="Transformer 编解码器\n\n4层 Encoder + 4层 Decoder\n8头注意力 + 位置编码\n\n融合图像特征 + 关节状态\n输出 10 步动作序列" fillcolor="#BB8FCE" color="#8E44AD"]
+        }
+    }
+
+    // 输入
+    WRIST [label="腕部相机画面\n(480×640 RGB)" fillcolor="#F1948A" color="#E74C3C" fontname="Noto Sans CJK SC"]
+    GLOBAL [label="全局相机画面\n(480×640 RGB)" fillcolor="#F1948A" color="#E74C3C" fontname="Noto Sans CJK SC"]
+    JOINTS [label="关节状态\n(j1~j6 + gripper)" fillcolor="#F1948A" color="#E74C3C" fontname="Noto Sans CJK SC"]
+
+    // 输出
+    OUTPUT [label="10 步动作序列\n(每步 = 7维关节位移)" fillcolor="#82E0AA" color="#1E8449" fontname="Noto Sans CJK SC"]
+    ACTION [label="只执行第 1 步\n机械臂运动" fillcolor="#82E0AA" color="#1E8449" fontname="Noto Sans CJK SC"]
+
+    // 数据流
+    WRIST -> RESNET [color="#E67E22" penwidth=2 label="  \n视觉特征" fontcolor="#E67E22" fontname="Noto Sans CJK SC" fontsize=10]
+    GLOBAL -> RESNET [color="#E67E22" penwidth=2]
+    RESNET -> TF [color="#2980B9" penwidth=2 label="  特征向量" fontcolor="#2980B9" fontname="Noto Sans CJK SC" fontsize=10]
+    JOINTS -> TF [color="#E67E22" penwidth=2 label="  本体感觉" fontcolor="#E67E22" fontname="Noto Sans CJK SC" fontsize=10]
+    TF -> OUTPUT [color="#8E44AD" penwidth=2 label="  预测" fontcolor="#8E44AD" fontname="Noto Sans CJK SC" fontsize=10]
+    OUTPUT -> ACTION [color="#1E8449" penwidth=2]
+}

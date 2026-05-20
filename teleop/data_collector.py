@@ -51,6 +51,9 @@ VELOCITY_PCT = 50
 DATASET_REPO = "piper/bottle_grasp"
 DATASET_ROOT = str(PROJECT_ROOT / "data" / "lerobot_dataset")
 TASK = "Grasp the bottle from the table"
+TASK_MODE = "approach_only"  # "approach_only" or "full_pick_place"
+GRIPPER_OPEN_VAL = 0.08      # gripper fully open (m)
+GRIPPER_CLOSE_VAL = 0.0      # gripper fully closed (m)
 
 WRIST_WIDTH, WRIST_HEIGHT, WRIST_FPS = 640, 480, 30
 GLOBAL_WIDTH, GLOBAL_HEIGHT, GLOBAL_FPS = 640, 480, 30
@@ -323,6 +326,18 @@ def parse_args():
         default=os.environ.get("PIPER_DATASET_REPO", DATASET_REPO),
         help="LeRobot dataset repo_id stored in metadata.",
     )
+    parser.add_argument(
+        "--task-mode",
+        choices=("approach_only", "full_pick_place"),
+        default=os.environ.get("PIPER_TASK_MODE", "approach_only"),
+        help="Recording mode: approach_only (default) or full_pick_place (approach+descend+close+lift+place+release).",
+    )
+    parser.add_argument(
+        "--record-gripper-action",
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=True,
+        help="Record real gripper state in action[6] (default: true). Set false to override gripper open.",
+    )
     return parser.parse_args()
 
 
@@ -412,8 +427,13 @@ def run_camera_preview(wrist_cam, global_cam):
 def main():
     args = parse_args()
 
+    # Set task description based on mode
+    task_str = TASK
+    if args.task_mode == "full_pick_place":
+        task_str = "Full pick-and-place: approach → descend → close → lift → place → release"
+
     print("=" * 60)
-    print("  Piper ACT Data Collector — Mirror Mode")
+    print(f"  Piper ACT Data Collector — Mirror Mode ({args.task_mode})")
     print("=" * 60)
 
     if args.list_cameras:
@@ -564,7 +584,7 @@ def main():
                     frame = {
                         "observation.state": np.array(prev_state, dtype=np.float32),
                         "action": np.array(cur_state, dtype=np.float32),
-                        "task": TASK,
+                        "task": task_str,
                         "observation.images.wrist_rgb": np.transpose(wrist_frame.rgb, (2, 0, 1)),
                         "observation.images.global_rgb": np.transpose(global_frame.rgb, (2, 0, 1)),
                     }

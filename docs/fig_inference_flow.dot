@@ -1,0 +1,82 @@
+digraph InferenceFlow {
+    rankdir=TB
+    fontname="Noto Sans CJK SC"
+    fontsize=18
+    label="推理数据流"
+    labelloc=t
+    newrank=true
+    nodesep=0.4
+    ranksep=0.5
+
+    node [fontname="Noto Sans CJK SC" fontsize=11 style="rounded,filled" penwidth=1.5 shape=box]
+
+    START [label="用户按空格" fillcolor="#9980FA" color="#5758BB" shape=oval]
+
+    subgraph cluster_capture {
+        label="采集观测"
+        fontname="Noto Sans CJK SC"
+        fontsize=13
+        style="rounded,dashed"
+        color="#E74C3C"
+        bgcolor="#FDEDEC"
+        penwidth=2
+        WRIST [label="腕部相机\nwrist_cam.read()\n→ (H,W,3) uint8" fillcolor="#F1948A" color="#E74C3C"]
+        GLOBAL [label="全局相机\nglobal_cam.read()\n→ (H,W,3) uint8" fillcolor="#F1948A" color="#E74C3C"]
+        JOINTS [label="关节状态\nrobot.get_joint_positions()\n→ [float]×7" fillcolor="#F1948A" color="#E74C3C"]
+    }
+
+    subgraph cluster_preprocess {
+        label="预处理 & 归一化 (CPU → GPU)"
+        fontname="Noto Sans CJK SC"
+        fontsize=13
+        style="rounded,dashed"
+        color="#2980B9"
+        bgcolor="#EBF5FB"
+        penwidth=2
+        IMG_PRE [label="图像预处理\nuint8 → float32/255\n(C,H,W) → 加 batch\n转移到 GPU" fillcolor="#85C1E9" color="#2980B9"]
+        STATE_PRE [label="状态预处理\n(7,) → (1,7)\n转移到 GPU" fillcolor="#85C1E9" color="#2980B9"]
+        NORM [label="归一化\n图像: (x - imagenet_mean)/std\n状态: (x - state_mean)/std" fillcolor="#5499C7" color="#2980B9" fontcolor="white"]
+    }
+
+    subgraph cluster_policy {
+        label="ACT Policy (GPU)"
+        fontname="Noto Sans CJK SC"
+        fontsize=13
+        style="rounded,dashed"
+        color="#8E44AD"
+        bgcolor="#F4ECF7"
+        penwidth=2
+        RESNET [label="ResNet18\n编码图像" fillcolor="#BB8FCE" color="#8E44AD"]
+        TF [label="Transformer\n融合多模态\n输出 (1,7) 归一化动作" fillcolor="#BB8FCE" color="#8E44AD"]
+    }
+
+    subgraph cluster_postprocess {
+        label="后处理 (GPU → 机械臂)"
+        fontname="Noto Sans CJK SC"
+        fontsize=13
+        style="rounded,dashed"
+        color="#1E8449"
+        bgcolor="#E9F7EF"
+        penwidth=2
+        DENORM [label="反归一化\naction * std + mean" fillcolor="#82E0AA" color="#1E8449"]
+        CLAMP [label="安全裁剪\njoint ∈ [-3.14, 3.14]\ngripper ∈ [0, 0.10]" fillcolor="#58D68D" color="#1E8449"]
+        EXEC [label="机械臂执行\nset_joint_positions()" fillcolor="#2ECC71" color="#1E8449"]
+    }
+
+    START -> {WRIST, GLOBAL, JOINTS} [color="#5758BB" penwidth=1.5]
+
+    WRIST -> IMG_PRE [color="#2980B9" penwidth=1.5]
+    GLOBAL -> IMG_PRE [color="#2980B9" penwidth=1.5]
+    JOINTS -> STATE_PRE [color="#2980B9" penwidth=1.5]
+
+    IMG_PRE -> NORM [color="#2980B9" penwidth=1.5]
+    STATE_PRE -> NORM [color="#2980B9" penwidth=1.5]
+
+    NORM -> RESNET [color="#8E44AD" penwidth=1.5 label=" 图像" fontcolor="#8E44AD"]
+    NORM -> TF [color="#8E44AD" penwidth=1.5 label=" 状态" fontcolor="#8E44AD"]
+    RESNET -> TF [color="#8E44AD" penwidth=1.5]
+
+    TF -> DENORM [color="#1E8449" penwidth=1.5]
+    DENORM -> CLAMP [color="#1E8449" penwidth=1.5]
+    CLAMP -> EXEC [color="#1E8449" penwidth=1.5]
+}
