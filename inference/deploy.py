@@ -124,12 +124,21 @@ def prepare_observation(state, wrist_img, global_img, device, expected_state_dim
 
 
 def build_preview(wrist_frame, global_frame, text: str, color=(0, 255, 0)):
-    preview = cv2.cvtColor(wrist_frame.rgb, cv2.COLOR_RGB2BGR)
-    cv2.putText(preview, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    preview = None
+    if wrist_frame is not None:
+        preview = cv2.cvtColor(wrist_frame.rgb, cv2.COLOR_RGB2BGR)
+        cv2.putText(preview, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     if global_frame is not None:
         g_preview = cv2.cvtColor(global_frame.rgb, cv2.COLOR_RGB2BGR)
-        g_preview = cv2.resize(g_preview, (preview.shape[1], preview.shape[0]))
-        preview = np.hstack([preview, g_preview])
+        if preview is not None:
+            g_preview = cv2.resize(g_preview, (preview.shape[1], preview.shape[0]))
+            preview = np.hstack([preview, g_preview])
+        else:
+            preview = g_preview
+            cv2.putText(preview, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    if preview is None:
+        preview = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(preview, "WAITING FOR CAMERA", (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     return preview
 
 
@@ -373,10 +382,11 @@ def save_alignment_images(rollout_dir: Path, label: str, wrist_frame, global_fra
 def read_final_camera_frames(wrist_cam, global_cam):
     wrist_frame = None
     global_frame = None
-    try:
-        wrist_frame = wrist_cam.read()
-    except Exception as exc:
-        print(f"  [WARN] Final RealSense read failed: {exc}")
+    if wrist_cam is not None:
+        try:
+            wrist_frame = wrist_cam.read()
+        except Exception as exc:
+            print(f"  [WARN] Final RealSense read failed: {exc}")
     if global_cam is not None:
         try:
             global_frame = global_cam.read()
@@ -516,6 +526,8 @@ def main():
                         help="EMA smoothing factor for consecutive action predictions (0=disabled, 0.3=default).")
     parser.add_argument("--no-global", action="store_true",
                         help="Disable global camera")
+    parser.add_argument("--no-wrist", action="store_true",
+                        help="Disable wrist RealSense camera. Use this only for policies trained without wrist_rgb.")
     parser.add_argument("--global-camera", type=str, default="auto",
                         help="Global camera device ID or 'auto'")
     parser.add_argument("--dry-run", action="store_true",
@@ -1270,18 +1282,27 @@ def main():
     # --- Init cameras ---
     step_n += 1
     print(f"\n[{step_n}/{total_n}] Initializing cameras ...")
-    rs_serials = find_realsense_devices()
-    wrist_serial = rs_serials[0] if rs_serials else ""
-    wrist_cam = RealSenseCamera(serial=wrist_serial, width=640, height=480, fps=30,
-                                enable_depth=False)
-
-    global_cam = None
     if args.policy_type in ("hybrid", "hybrid-v3", "hybrid-v4-delta"):
+        requires_wrist = True
         requires_global = False
     else:
+        requires_wrist = "observation.images.wrist_rgb" in policy.config.input_features
         requires_global = "observation.images.global_rgb" in policy.config.input_features
+    if args.no_wrist and requires_wrist:
+        raise ValueError("This policy was trained with wrist_rgb, so --no-wrist cannot be used.")
     if args.no_global and requires_global:
         raise ValueError("This policy was trained with global_rgb, so --no-global cannot be used.")
+
+    wrist_cam = None
+    if not args.no_wrist:
+        rs_serials = find_realsense_devices()
+        wrist_serial = rs_serials[0] if rs_serials else ""
+        wrist_cam = RealSenseCamera(serial=wrist_serial, width=640, height=480, fps=30,
+                                    enable_depth=False)
+    else:
+        print("  Wrist camera disabled (--no-wrist).")
+
+    global_cam = None
     if not args.no_global:
         try:
             global_cam = USBCamera(device_id=args.global_camera, width=640, height=480, fps=30)
@@ -1359,7 +1380,7 @@ def main():
                 if cmd == "q":
                     break
             else:
-                wrist_frame = wrist_cam.read()
+                wrist_frame = wrist_cam.read() if wrist_cam else None
                 global_frame = global_cam.read() if global_cam else None
 
                 preview = build_preview(wrist_frame, global_frame, "READY - SPACE run")
@@ -1472,13 +1493,13 @@ def main():
                 loop_start = time.time()
 
                 # Capture fresh observation
-                wrist_frame = wrist_cam.read()
+                wrist_frame = wrist_cam.read() if wrist_cam else None
                 global_frame = global_cam.read() if global_cam else None
                 robot_state = robot.get_joint_positions()
                 phase = 0.0 if approach_steps <= 1 else min(1.0, step / float(approach_steps - 1))
 
                 # Build observation
-                wrist_img = wrist_frame.rgb
+                wrist_img = wrist_frame.rgb if wrist_frame else None
                 global_img = global_frame.rgb if global_frame else None
                 if args.save_final_images and rollout_dir is not None and step in (0, 50, 100):
                     save_alignment_images(rollout_dir, f"step_{step:03d}", wrist_frame, global_frame)
@@ -2522,7 +2543,8 @@ def main():
         except Exception:
             pass
         print("  Stopped. Arm stays ENABLED at current position.")
-        wrist_cam.close()
+        if wrist_cam:
+            wrist_cam.close()
         if global_cam:
             global_cam.close()
         if not args.no_gui:
