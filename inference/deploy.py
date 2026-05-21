@@ -379,6 +379,33 @@ def save_alignment_images(rollout_dir: Path, label: str, wrist_frame, global_fra
         save_camera_png(global_frame, rollout_dir / f"{label}_usb.png", "USB camera")
 
 
+def create_camera_video_writer(frame, out_path: Path, fps: float, camera_label: str):
+    """Create an mp4 writer from the first camera frame dimensions."""
+    if frame is None:
+        return None
+    height, width = frame.rgb.shape[:2]
+    writer = cv2.VideoWriter(
+        str(out_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        print(f"  [WARN] Cannot open {camera_label} video writer: {out_path}")
+        writer.release()
+        return None
+    print(f"  Recording {camera_label} video: {out_path} ({width}x{height} @ {fps:.1f}fps)")
+    return writer
+
+
+def write_camera_video_frame(writer, frame) -> bool:
+    """Append one RGB camera frame to an OpenCV video writer."""
+    if writer is None or frame is None:
+        return False
+    writer.write(cv2.cvtColor(frame.rgb, cv2.COLOR_RGB2BGR))
+    return True
+
+
 def read_final_camera_frames(wrist_cam, global_cam):
     wrist_frame = None
     global_frame = None
@@ -445,10 +472,12 @@ def get_gripper_phase(pred_grip: float, grip_open: float, grip_close: float,
 
 def check_phase_stop(stop_after: str, step: int,
                      grip_pred_history: list, grip_open: float, grip_close: float,
-                     close_detected: bool, release_detected: bool,
+                     close_detected: bool, strong_close_detected: bool,
+                     release_detected: bool,
                      close_step: int, release_step: int,
                      consecutive_close_count: int, consecutive_release_count: int,
-                     lift_steps_after_close: int):
+                     lift_steps_after_close: int,
+                     release_steps_after_detect: int):
     """Determine whether to stop based on phase and stop_after mode.
 
     Returns (should_stop: bool, stop_reason: str).
@@ -463,9 +492,10 @@ def check_phase_stop(stop_after: str, step: int,
                 return True, "approach_stop (gripper about to close)"
 
     elif stop_after == "close":
-        # Stop after close detected + sustained for 3 frames
-        if close_detected and consecutive_close_count >= 3:
-            return True, "close_stop (close sustained 3 frames)"
+        # Stage-B close checks should stop only after the gripper reaches the
+        # dataset-like strong-close region, not as soon as onset is detected.
+        if strong_close_detected:
+            return True, "close_stop (strong close sustained 3 frames)"
 
     elif stop_after == "lift":
         # Stop after close + 30 more steps
@@ -473,9 +503,10 @@ def check_phase_stop(stop_after: str, step: int,
             return True, "lift_stop (close + 30 steps)"
 
     elif stop_after == "release":
-        # Stop after release detected + sustained for 3 frames
-        if release_detected and consecutive_release_count >= 3:
-            return True, "release_stop (release sustained 3 frames)"
+        # Release detection happens at reopen onset. Keep executing briefly so
+        # the commanded reopen can reach the physical gripper before staging stops.
+        if release_detected and step - release_step >= release_steps_after_detect:
+            return True, f"release_stop (release + {release_steps_after_detect} steps)"
 
     # "full": never early stop
 
@@ -572,6 +603,9 @@ def main():
                         "raw robot_state[J2], obs.state[J2], normalized_state[J2], raw_action[J2].")
     parser.add_argument("--save-rollout", action="store_true",
                         help="Save rollout frames (image, state, action) to disk for offline analysis.")
+    parser.add_argument("--save-global-video", action="store_true",
+                        help="Save the raw global-camera view for each active rollout as global_view.mp4 "
+                             "inside the rollout directory.")
     parser.add_argument("--save-final-images", action="store_true",
                         help="Save approach alignment camera images and JSON to the rollout directory.")
     parser.add_argument("--debug-offline-policy-rollout-from-recorded-start", action="store_true",
@@ -626,7 +660,7 @@ def main():
                         default="approach",
                         help="[act-full + full-e2e] Stop trajectory after which phase. "
                              "approach: before gripper closes. close: after close detected. "
-                             "lift: close + 30 steps. release: after release detected. "
+                             "lift: close + 30 steps. release: after release onset + execution window. "
                              "full: no early stop (complete trajectory). Default: approach.")
     parser.add_argument("--act-full-chunk-exec", choices=("normal", "hold_last_until_ready", "target_reached"),
                         default="normal",
@@ -658,7 +692,18 @@ def main():
     parser.add_argument("--gripper-close-strong-threshold", type=float, default=0.055,
                         help="[act-full] Absolute grip value below which close is considered strong/complete. "
                              "Default: 0.055 (dataset min + 0.01).")
+    parser.add_argument("--gripper-release-onset-threshold", type=float, default=None,
+                        help="[act-full] Absolute grip value above which a confirmed strong close "
+                             "is considered a release/reopen onset. Default: midpoint between "
+                             "act-full open and strong-close thresholds.")
+    parser.add_argument("--release-stop-min-steps", type=int, default=10,
+                        help="[act-full + --full-e2e-stop-after release] Control steps to keep "
+                             "executing after release onset before the staged release stop. "
+                             "Default: 10.")
     args = parser.parse_args()
+
+    if args.release_stop_min_steps < 0:
+        parser.error("--release-stop-min-steps must be >= 0")
 
     if args.no_auto_return:
         args.no_return_to_start = True
@@ -720,6 +765,14 @@ def main():
         # relative/dataset: strong = mid between onset and close
         _close_strong_threshold = max(_close_onset_threshold / 2.0, 0.02)
 
+    if args.gripper_release_onset_threshold is not None:
+        _release_onset_threshold = float(args.gripper_release_onset_threshold)
+    else:
+        # Release starts from the object-width grasp region, not from a 0.0
+        # gripper. Use the strong-close-to-open midpoint like the dataset
+        # crossing heuristic so a real reopen is not hidden by close onset.
+        _release_onset_threshold = (_close_strong_threshold + act_full_gripper_open) / 2.0
+
     _close_detect_onset_count = 3   # consecutive steps below onset to latch
     _close_detect_strong_count = 3  # consecutive steps below strong to confirm
 
@@ -728,6 +781,7 @@ def main():
         print(f"    recorded_start_gripper = {_rec_start_grip:.5f}")
         print(f"    close_onset_threshold  = {_close_onset_threshold:.5f}")
         print(f"    close_strong_threshold = {_close_strong_threshold:.5f}")
+        print(f"    release_onset_threshold= {_release_onset_threshold:.5f}")
         print(f"    absolute_midpoint      = {_grip_mid_absolute:.5f}")
 
     # Build per-dimension scale array: [J1, J2, J3, J4, J5, J6, Grip]
@@ -1346,6 +1400,8 @@ def main():
         print(f"  → Full end-to-end: approach + descend + close + lift + place + release (model-driven).")
         if is_act_full:
             print(f"  → Stop after: {stop_label} (--full-e2e-stop-after)")
+            if stop_label == "release":
+                print(f"  → Release stop window: {args.release_stop_min_steps} steps after onset")
     else:
         print(f"  → Approach + close ({GRIPPER_CLOSE:.3f} m) + lift (J3 -= 0.06).")
     if args.dry_run:
@@ -1360,6 +1416,8 @@ def main():
         print(f"  HOLD AFTER STOP: {args.hold_after_stop:.1f}s")
     if args.save_final_images:
         print("  FINAL IMAGE DEBUG: enabled")
+    if args.save_global_video:
+        print(f"  GLOBAL VIDEO: active rollout view will save at {args.hz:.1f}fps")
     if recorded_start_qpos is not None:
         print(f"  Reset guard expected start: {fmt_vec(recorded_start_qpos, 5)}")
         print(f"  Reset guard source: {recorded_start_source}")
@@ -1372,6 +1430,7 @@ def main():
               f"J1/J3/J4/J5/J6 from {ver_label}.")
     print("-" * 60 + "\n")
 
+    global_video_writer = None
     try:
         while True:
             # --- Live preview ---
@@ -1416,12 +1475,19 @@ def main():
             # Setup rollout saving directory
             rollout_dir = None
             _csv_fh = None
-            if args.save_rollout or args.save_final_images:
+            _global_video_path = None
+            _global_video_frames = 0
+            if args.save_rollout or args.save_final_images or args.save_global_video:
                 import datetime
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 rollout_dir = Path(PROJECT_ROOT) / "logs" / "rollouts" / f"test_a_{ts}"
                 rollout_dir.mkdir(parents=True, exist_ok=True)
                 print(f"  Saving rollout to {rollout_dir}")
+                if args.save_global_video:
+                    if global_cam is None:
+                        print("  [WARN] --save-global-video requested but global camera is unavailable.")
+                    else:
+                        _global_video_path = rollout_dir / "global_view.mp4"
                 # Per-step CSV for close phase debug
                 _csv_path = rollout_dir / "step_log.csv"
                 try:
@@ -1458,6 +1524,7 @@ def main():
             full_e2e_phase_tracking = (is_act_full and args.test_mode == "full-e2e")
             grip_pred_history = []       # last N gripper predictions for phase detection
             close_detected = False
+            strong_close_detected = False
             release_detected = False
             close_step = -1
             release_step = -1
@@ -1495,6 +1562,18 @@ def main():
                 # Capture fresh observation
                 wrist_frame = wrist_cam.read() if wrist_cam else None
                 global_frame = global_cam.read() if global_cam else None
+                if _global_video_path is not None and global_frame is not None:
+                    if global_video_writer is None:
+                        global_video_writer = create_camera_video_writer(
+                            global_frame,
+                            _global_video_path,
+                            args.hz,
+                            "global camera",
+                        )
+                        if global_video_writer is None:
+                            _global_video_path = None
+                    if write_camera_video_frame(global_video_writer, global_frame):
+                        _global_video_frames += 1
                 robot_state = robot.get_joint_positions()
                 phase = 0.0 if approach_steps <= 1 else min(1.0, step / float(approach_steps - 1))
 
@@ -1858,6 +1937,23 @@ def main():
                 sent_target[:6] = np.clip(sent_target[:6], -3.14, 3.14)
                 sent_target[6] = np.clip(sent_target[6], 0.0, PIPER_GRIPPER_MAX_M)
 
+                # Probe policy reopen intent before the close latch below clamps it.
+                # Requiring a confirmed strong close avoids treating a close-onset
+                # rebound as the release phase.
+                policy_grip_before_latch = float(sent_target[6])
+                if (full_e2e_phase_tracking and close_detected and strong_close_detected
+                        and not release_detected):
+                    if policy_grip_before_latch > _release_onset_threshold:
+                        consecutive_release_count += 1
+                        if consecutive_release_count >= _close_detect_onset_count:
+                            release_detected = True
+                            release_step = step
+                            print(f"\n  [CLOSE] Release detected at step {step+1}: "
+                                  f"policy_grip={policy_grip_before_latch:.5f} "
+                                  f"> release_onset={_release_onset_threshold:.5f}")
+                    else:
+                        consecutive_release_count = max(0, consecutive_release_count - 1)
+
                 # Gripper close latch: once close is confirmed, prevent policy from
                 # re-opening the gripper before release is detected. This counters the
                 # policy's learned "return to open" behavior within a trajectory chunk.
@@ -1892,19 +1988,14 @@ def main():
                         else:
                             consecutive_close_count = max(0, consecutive_close_count - 1)
                     elif not release_detected:
-                        # Already closed — check for strong close and reopen
+                        # Already closed — confirm strong close. Release detection
+                        # uses the unlatched policy grip above so the latch does not
+                        # hide a real reopen command from the phase tracker.
                         if pred_grip < _close_strong_threshold and consecutive_close_count < _close_detect_strong_count + _close_detect_onset_count:
                             consecutive_close_count += 1
                             if consecutive_close_count >= _close_detect_onset_count + _close_detect_strong_count:
+                                strong_close_detected = True
                                 print(f"  [CLOSE] Strong close at step {step+1}: grip={pred_grip:.5f} < strong={_close_strong_threshold:.5f}")
-                        if pred_grip > _close_onset_threshold:
-                            consecutive_release_count += 1
-                            if consecutive_release_count >= _close_detect_onset_count and not release_detected:
-                                release_detected = True
-                                release_step = step
-                                print(f"\n  [CLOSE] Release detected at step {step+1}: grip={pred_grip:.5f} > onset={_close_onset_threshold:.5f}")
-                        else:
-                            consecutive_release_count = max(0, consecutive_release_count - 1)
 
                     # Early gripper close safety check (first 30 steps)
                     if close_detected and step < 30 and not early_gripper_close_warned:
@@ -1943,6 +2034,7 @@ def main():
                           f"  ready={ready_count}/{READY_COUNT_MIN}  stop_act={stop_act}")
                     if full_e2e_phase_tracking:
                         print(f"    grip_phase={gripper_phase}  close_detected={close_detected}"
+                              f"  strong_close_detected={strong_close_detected}"
                               f"  release_detected={release_detected}"
                               f"  stop_after={args.full_e2e_stop_after}")
                         if close_detected:
@@ -1977,10 +2069,11 @@ def main():
                     should_phase_stop, phase_stop_reason = check_phase_stop(
                         args.full_e2e_stop_after, step,
                         grip_pred_history, act_full_gripper_open, GRIPPER_CLOSE,
-                        close_detected, release_detected,
+                        close_detected, strong_close_detected, release_detected,
                         close_step, release_step,
                         consecutive_close_count, consecutive_release_count,
                         30,  # lift_steps_after_close
+                        args.release_stop_min_steps,
                     )
                     if should_phase_stop:
                         # Send final target then break
@@ -2062,10 +2155,20 @@ def main():
                         sent_target=sent_target.copy(),
                         step=step,
                     )
-                    # Save wrist image every 20 steps (to save disk)
+                    # Save camera images sparsely to keep rollout size bounded.
                     if step % 20 == 0:
-                        cv2.imwrite(str(rollout_dir / f"wrist_{step:04d}.jpg"),
-                                    cv2.cvtColor(wrist_frame.rgb, cv2.COLOR_RGB2BGR))
+                        if wrist_frame is not None:
+                            save_camera_png(
+                                wrist_frame,
+                                rollout_dir / f"wrist_{step:04d}.jpg",
+                                "RealSense",
+                            )
+                        if global_frame is not None:
+                            save_camera_png(
+                                global_frame,
+                                rollout_dir / f"global_{step:04d}.jpg",
+                                "USB camera",
+                            )
 
                 # ── Send to robot ──
                 if not args.dry_run:
@@ -2134,6 +2237,11 @@ def main():
 
                 last_smoothed = smoothed_arm.copy()
                 last_state = np.asarray(robot_state, dtype=np.float32).copy()
+
+            if global_video_writer is not None:
+                global_video_writer.release()
+                global_video_writer = None
+                print(f"  Saved global camera video: {_global_video_path} ({_global_video_frames} frames)")
 
             # ── Print raw action stats ──
             if raw_actions:
@@ -2218,6 +2326,7 @@ def main():
                 print(f"    First close candidate  : step={_first_close_candidate_step}"
                       f"{' (NONE)' if _first_close_candidate_step < 0 else ''}")
                 print(f"    close_detected         : {close_detected} (step={close_step})")
+                print(f"    strong_close_detected  : {strong_close_detected}")
                 print(f"    Final raw action       : {fmt_vec(raw_actions[-1], 5)}" if raw_actions else "    No raw actions")
                 print(f"    Final target qpos      : {fmt_vec(final_target, 5)}" if final_target is not None else "    No final target")
                 if _chunk_history:
@@ -2256,6 +2365,7 @@ def main():
                 # Phase summary
                 if is_act_full:
                     print(f"  [FULL-E2E] Phase: close_detected={close_detected} (step={close_step})"
+                          f"  strong_close_detected={strong_close_detected}"
                           f"  release_detected={release_detected} (step={release_step})")
                     print(f"  [FULL-E2E] Final gripper_phase={gripper_phase}")
                     # Show last gripper prediction
@@ -2536,6 +2646,8 @@ def main():
     except KeyboardInterrupt:
         print("\n  Interrupted.")
     finally:
+        if global_video_writer is not None:
+            global_video_writer.release()
         # Emergency stop: hold current position, do NOT disable
         try:
             cur = robot.get_joint_positions()

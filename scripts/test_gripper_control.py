@@ -24,7 +24,7 @@ def main():
     from hardware.piper_wrapper import PiperRobot
 
     print("Connecting to Piper arm...")
-    robot = PiperRobot()
+    robot = PiperRobot(disable_torque_on_disconnect=False)
     robot.connect()  # connect + enable in one call
 
     current = np.asarray(robot.get_joint_positions(), dtype=np.float32)
@@ -86,7 +86,11 @@ def main():
     print("    → SDK expects meters but hardware returns raw. Unit mismatch.")
     print("=" * 70)
 
-    robot.disable()
+    # Keep the arm enabled after a gripper-only check; disabling here can let
+    # gravity drop an unsupported pose.
+    current = robot.get_joint_positions()
+    robot.set_joint_positions(current, velocity_pct=25)
+    print("\nDone. Arm stays ENABLED at current position.")
     return 0
 
 

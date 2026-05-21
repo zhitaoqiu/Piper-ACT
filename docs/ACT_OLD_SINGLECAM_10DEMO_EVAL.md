@@ -156,4 +156,60 @@ Pass criteria:
 - Bottle does not drop immediately.
 - Robot remains stable.
 
-Do not run full directly. If this fails, inspect old data quality, camera placement mismatch, and deploy camera mismatch before changing model family.
+## Stage D: Release
+
+Only run after Stage C passes.
+
+```bash
+python3 inference/deploy.py \
+  --policy-type act-full \
+  --checkpt outputs/train/act_old_singlecam_10demo/checkpoints/003000/pretrained_model \
+  --test-mode full-e2e \
+  --full-e2e-stop-after release \
+  --release-stop-min-steps 10 \
+  --hz 10 \
+  --approach-steps 360 \
+  --no-wrist \
+  --global-camera auto \
+  --open-gripper-on-start \
+  --enforce-start-reset \
+  --act-full-chunk-exec target_reached \
+  --act-full-target-tol 0.04 \
+  --save-rollout --save-final-images \
+  --hold-after-stop 8 --no-auto-return \
+  --debug-actions --debug-policy-io \
+  --allow-real-full-e2e
+```
+
+Pass criteria:
+
+- Approach, close, and lift still pass.
+- The policy reaches release onset after a confirmed strong close.
+- Gripper visibly reopens enough to release the bottle at the place phase.
+- Robot remains stable at the stop pose.
+
+## Full Attempt
+
+Only run after Stage D passes.
+
+```bash
+python3 inference/deploy.py \
+  --policy-type act-full \
+  --checkpt outputs/train/act_old_singlecam_10demo/checkpoints/003000/pretrained_model \
+  --test-mode full-e2e \
+  --full-e2e-stop-after full \
+  --hz 10 \
+  --approach-steps 360 \
+  --no-wrist \
+  --global-camera auto \
+  --open-gripper-on-start \
+  --enforce-start-reset \
+  --act-full-chunk-exec target_reached \
+  --act-full-target-tol 0.04 \
+  --save-rollout --save-global-video --save-final-images \
+  --hold-after-stop 8 --no-auto-return \
+  --debug-actions --debug-policy-io \
+  --allow-real-full-e2e
+```
+
+If a staged run fails, inspect old data quality, camera placement mismatch, and deploy camera mismatch before changing model family.

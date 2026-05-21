@@ -1,0 +1,7 @@
+checkpoint,checkpoint_path,mean_mse,returncode,status
+001000,/home/huatec/piper_act_bottle_grasp/outputs/train/act_old_singlecam_30demo/checkpoints/001000/pretrained_model,0.003974,0,ok
+002000,/home/huatec/piper_act_bottle_grasp/outputs/train/act_old_singlecam_30demo/checkpoints/002000/pretrained_model,0.001987,0,ok
+003000,/home/huatec/piper_act_bottle_grasp/outputs/train/act_old_singlecam_30demo/checkpoints/003000/pretrained_model,0.000945,0,ok
+004000,/home/huatec/piper_act_bottle_grasp/outputs/train/act_old_singlecam_30demo/checkpoints/004000/pretrained_model,0.000712,0,ok
+005000,/home/huatec/piper_act_bottle_grasp/outputs/train/act_old_singlecam_30demo/checkpoints/005000/pretrained_model,0.000609,0,ok
+last,/home/huatec/piper_act_bottle_grasp/outputs/train/act_old_singlecam_30demo/checkpoints/last/pretrained_model,0.000609,0,ok
