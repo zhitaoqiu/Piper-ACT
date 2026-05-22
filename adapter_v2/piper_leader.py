@@ -1,4 +1,8 @@
-"""Optional LeRobot-style Piper leader for adapter v2."""
+"""Optional software-leader Piper teleoperator for adapter v2.
+
+The local powered teaching-arm workflow mirrors into the follower directly and
+records follower state on `can0`; it does not use this second-CAN action source.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ class PiperLeaderV2Config(TeleoperatorConfig):
 
 
 class PiperLeaderV2(Teleoperator):
-    """Read a second Piper arm as a leader action source when available."""
+    """Read a separately validated Piper leader CAN path when available."""
 
     config_class = PiperLeaderV2Config
     name = "piper_leader_v2"
@@ -59,7 +63,10 @@ class PiperLeaderV2(Teleoperator):
 
     def connect(self, calibrate: bool = True) -> None:
         if not self.config.can_port:
-            raise ValueError("PiperLeaderV2 requires an explicit --teleop.can_port after CAN validation.")
+            raise ValueError(
+                "PiperLeaderV2 requires an explicit separately validated --teleop.can_port. "
+                "The current powered teaching-arm mirror flow uses record_adapter_v2_mirror.py."
+            )
         self.bus.connect(calibrate=calibrate)
         self.configure()
         logger.info("%s connected on %s.", self, self.config.can_port)

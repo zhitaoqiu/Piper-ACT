@@ -42,6 +42,21 @@ Local measurements remain authoritative:
 - current single-camera key is `observation.images.global_rgb`
 - do not mix in the wrist camera for the first adapter-v2 one-demo path
 
+## Current Piper topology
+
+The local Piper teaching setup is a powered hardware mirror path:
+
+- the teaching arm controls the follower directly after the teaching arm is
+  powered
+- the computer sees the follower on `can0`
+- the recorder reads follower qpos/gripper plus the global camera
+- the recorded mirror action remains follower next-state action in the existing
+  LeRobot dataset schema
+
+There is no second leader CAN interface in the current setup. Adapter v2 must
+not block the data path on a software `PiperLeader` teleoperator that this
+hardware topology does not use.
+
 ## Stage 1 surface
 
 The first adapter-v2 code lives outside the successful deploy path:
@@ -49,8 +64,8 @@ The first adapter-v2 code lives outside the successful deploy path:
 - `adapter_v2/piper_bus.py`: SDK-backed rad/meter motor bus built on the
   locally validated Piper wrapper
 - `adapter_v2/piper_follower.py`: `piper_follower_v2` LeRobot robot
-- `adapter_v2/piper_leader.py`: optional `piper_leader_v2` teleoperator for a
-  validated second Piper CAN path
+- `adapter_v2/piper_leader.py`: retained VA11Hall-style software leader
+  scaffolding, not the active local teaching path
 - `adapter_v2/reset.py`: standard start reset, reset guard, and gripper open
 - `scripts/record_adapter_v2.py`: adapter registration plus standard LeRobot
   record entrypoint
@@ -113,8 +128,8 @@ Record one single-camera demo only after Step 3 passes. Reset motion must happen
 before `record`; it must not be inside the saved episode.
 
 The current machine inventory on 2026-05-22 shows only the working `can0`
-interface. Use the single-CAN mirror path for the first one-demo adapter/data
-validation:
+interface because the powered teaching arm drives the follower directly. Use
+the single-CAN mirror path for the first one-demo adapter/data validation:
 
 ```bash
 python3 scripts/record_adapter_v2_mirror.py \
@@ -123,30 +138,15 @@ python3 scripts/record_adapter_v2_mirror.py \
 ```
 
 This command checks the adapter-v2 reset guard before opening the recorder. It
-records only `observation.images.global_rgb` and uses the hardware mirror action
-source already validated in this repo. Save exactly one episode with SPACE, then
-quit the recorder with Q/ESC. This adapter-v2 mirror entrypoint keeps Piper
-enabled on exit; it must not drop the arm when the recording window closes.
+records only `observation.images.global_rgb` and uses the powered hardware
+mirror action source already validated in this repo. Save exactly one episode
+with SPACE, then quit the recorder with Q/ESC. This adapter-v2 mirror entrypoint
+keeps Piper enabled on exit; it must not drop the arm when the recording window
+closes.
 
-The standard two-arm software leader command shape remains the target after a
-separate leader CAN path is validated:
-
-```bash
-python3 scripts/record_adapter_v2.py \
-  --robot.type=piper_follower_v2 \
-  --robot.can_port=can0 \
-  --robot.cameras="{global_rgb: {type: opencv, index_or_path: /dev/video6, width: 640, height: 480, fps: 30}}" \
-  --teleop.type=piper_leader_v2 \
-  --teleop.can_port=<validated-leader-can-port> \
-  --dataset.repo_id=piper/adapter_v2_one_demo \
-  --dataset.root=data/lerobot_dataset_piper_adapter_v2_one_demo \
-  --dataset.num_episodes=1 \
-  --dataset.single_task="Pick and place the fixed bottle" \
-  --dataset.push_to_hub=false \
-  --dataset.fps=30
-```
-
-Do not invent a leader CAN name. Validate the actual leader path first.
+`scripts/record_adapter_v2.py` and `piper_leader_v2` remain reference
+scaffolding for a different software-leader topology. Do not use them for the
+current powered teaching-arm recording flow.
 
 ### Step 5: dataset sanity check
 

@@ -13,6 +13,12 @@ record/replay discipline boldly, while revalidating local joint order, sign,
 units, CAN names, gripper scale, camera devices, reset pose, motion limits, and
 enable/disable behavior on this Piper setup.
 
+The local teaching topology is now explicit: this Piper setup does not expose a
+separate leader CAN to the recorder. After the teaching arm is powered, it
+directly controls the follower arm. Adapter v2 records the follower through
+`can0` with the global camera, so `PiperLeader` stays a VA11Hall-style reference
+shape rather than the active Stage 1 data source.
+
 参考：
 
 - 知乎专栏：Piper部署ACT模型  
