@@ -29,6 +29,7 @@ piper_sdk_py_driver/
 # Large files
 *.log
 /tmp/
+logs/
 
 # OS
 .DS_Store

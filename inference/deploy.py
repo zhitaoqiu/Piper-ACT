@@ -535,6 +535,237 @@ def select_policy_action(policy, postprocessor, normalized_obs, replan_every_ste
     return postprocessor(action), None
 
 
+# ═══════════════════════════════════════════════════════════════════
+# ACT inference-time action smoothing (VA11Hall method)
+#
+# Ref: 《持续更新|第六弹：PiPER移植lerobot运动控制优化》
+#      https://jszn.csdn.net/6a053fc554b52172bc74084a.html
+#
+# Core logic:
+#   1. When action queue has only 1 action left, save it as
+#      previous_chunk_last_action.
+#   2. When a new chunk is generated, apply boundary interpolation
+#      on the first K steps using the saved last action.
+#   3. Then apply mean filter to the entire chunk (J1-J6 only).
+#   4. Gripper is excluded from smoothing by default.
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _mean_filter_1d(signal: np.ndarray, window: int) -> np.ndarray:
+    """Moving average along axis=0 with edge replication (preserves length)."""
+    if window <= 1 or len(signal) <= 1:
+        return signal.copy()
+    kernel = np.ones(window) / window
+    pad = window // 2
+    padded = np.pad(signal, ((pad, pad), (0, 0)), mode="edge")
+    out = np.zeros_like(signal)
+    n_dims = signal.shape[1]
+    for d in range(n_dims):
+        out[:, d] = np.convolve(padded[:, d], kernel, mode="valid")
+    return out
+
+
+def apply_boundary_blend(new_chunk: np.ndarray,
+                         prev_last_action: np.ndarray | None,
+                         blend_steps: int,
+                         blend_gripper: bool = False) -> np.ndarray:
+    """Linearly interpolate first K steps of new_chunk toward prev_last_action.
+
+    Only blends arm joints J1-J6 by default. Gripper only if blend_gripper=True.
+    """
+    chunk = new_chunk.copy()
+    if prev_last_action is None or blend_steps <= 0:
+        return chunk
+    K = min(blend_steps, chunk.shape[0])
+    for i in range(K):
+        w = (i + 1) / (K + 1)
+        chunk[i, :6] = (1.0 - w) * prev_last_action[:6] + w * new_chunk[i, :6]
+        if blend_gripper:
+            chunk[i, 6] = (1.0 - w) * prev_last_action[6] + w * new_chunk[i, 6]
+    return chunk
+
+
+def apply_mean_filter(chunk: np.ndarray,
+                      window: int,
+                      smooth_arm_only: bool = True,
+                      smooth_gripper: bool = False) -> np.ndarray:
+    """Apply moving average to arm joints (and optionally gripper)."""
+    if window <= 1:
+        return chunk.copy()
+    out = chunk.copy()
+    out[:, :6] = _mean_filter_1d(chunk[:, :6], window)
+    if smooth_gripper:
+        grip_2d = chunk[:, 6:7]
+        out[:, 6] = _mean_filter_1d(grip_2d, window)[:, 0]
+    return out
+
+
+def dry_run_act_smoothing(checkpt_dir: str, dataset_root: str,
+                           blend_steps: int, mean_filter_window: int,
+                           smooth_arm_only: bool, smooth_gripper: bool,
+                           num_episodes: int, device: str = "cuda") -> int:
+    """Offline verification: load checkpoint + dataset, compare raw vs smoothed chunks."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.policies.act.modeling_act import ACTPolicy
+    from lerobot.policies.factory import make_pre_post_processors
+
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    print(f"Device: {dev}")
+
+    print(f"Loading policy from {checkpt_dir} ...")
+    policy = ACTPolicy.from_pretrained(checkpt_dir).to(dev).eval()
+
+    preprocessor_overrides = {
+        "device_processor": {"device": dev.type},
+        "normalizer_processor": {"device": dev.type},
+    }
+    postprocessor_overrides = {
+        "unnormalizer_processor": {"device": dev.type},
+        "device_processor": {"device": "cpu"},
+    }
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy.config,
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
+    )
+
+    print(f"Loading dataset from {dataset_root} ...")
+    ds = LeRobotDataset("piper/bottle_grasp", root=dataset_root)
+    meta = json.loads(Path(dataset_root, "meta", "info.json").read_text())
+    camera_keys = sorted(k for k, v in meta["features"].items()
+                         if k.startswith("observation.images.") and v.get("dtype") == "video")
+    camera_key = camera_keys[0] if camera_keys else "observation.images.global_rgb"
+    print(f"Camera key: {camera_key}")
+
+    all_boundary_jumps_before = []
+    all_boundary_jumps_after = []
+    all_raw = []
+    all_smoothed = []
+
+    for ep in range(min(num_episodes, len(ds))):
+        ep_indices = np.where(np.array(ds.hf_dataset["episode_index"]) == ep)[0]
+        if len(ep_indices) == 0:
+            continue
+
+        print(f"\nEpisode {ep}: {len(ep_indices)} frames")
+        prev_last = None
+        frame_indices = ep_indices[:min(220, len(ep_indices))]
+        chunk_size = policy.config.chunk_size
+
+        for idx in range(0, len(frame_indices), chunk_size):
+            batch_indices = frame_indices[idx:idx + 1]
+            if len(batch_indices) == 0:
+                break
+
+            item = ds[batch_indices[0]]
+            state_val = item["observation.state"]
+            img_val = item[camera_key]
+            if isinstance(state_val, np.ndarray):
+                state_t = torch.from_numpy(state_val).float()
+            else:
+                state_t = state_val.float()
+            if isinstance(img_val, np.ndarray):
+                img_t = torch.from_numpy(img_val).float()
+            else:
+                img_t = img_val.float()
+            obs = {
+                "observation.state": state_t.unsqueeze(0).to(dev),
+                camera_key: img_t.unsqueeze(0).to(dev),
+            }
+
+            with torch.inference_mode():
+                norm_obs = preprocessor(obs)
+                chunk = policy.predict_action_chunk(norm_obs)
+                chunk = postprocessor(chunk)
+                raw_chunk = chunk.squeeze(0).cpu().numpy()  # (chunk_size, 7)
+
+            # ── Boundary jump BEFORE smoothing ──
+            if prev_last is not None:
+                jump_before = float(np.linalg.norm(raw_chunk[0, :6] - prev_last[:6]))
+                all_boundary_jumps_before.append(jump_before)
+
+            # ── Step 1: boundary interpolation ──
+            blended = apply_boundary_blend(raw_chunk, prev_last, blend_steps,
+                                           blend_gripper=smooth_gripper)
+
+            # ── Step 2: mean filter ──
+            smoothed = apply_mean_filter(blended, mean_filter_window,
+                                         smooth_arm_only=smooth_arm_only,
+                                         smooth_gripper=smooth_gripper)
+
+            # ── Boundary jump AFTER smoothing ──
+            if prev_last is not None:
+                jump_after = float(np.linalg.norm(smoothed[0, :6] - prev_last[:6]))
+                all_boundary_jumps_after.append(jump_after)
+
+            if prev_last is not None:
+                all_raw.append(raw_chunk)
+                all_smoothed.append(smoothed)
+
+            prev_last = smoothed[-1].copy()
+
+    if not all_raw:
+        print("\n[ERROR] Not enough data for comparison. Need at least 2 chunks.")
+        return 1
+
+    raw_stack = np.concatenate(all_raw, axis=0)
+    smoothed_stack = np.concatenate(all_smoothed, axis=0)
+
+    print(f"\n{'='*70}")
+    print(f"  Dry-Run ACT Smoothing Verification (VA11Hall method)")
+    print(f"  act_boundary_blend_steps={blend_steps}  act_mean_filter_window={mean_filter_window}")
+    print(f"  smooth_arm_only={smooth_arm_only}  smooth_gripper={smooth_gripper}")
+    print(f"  Total frames compared: {len(raw_stack)}")
+    print(f"{'='*70}")
+
+    # ── Boundary jump stats ──
+    if all_boundary_jumps_before:
+        jumps_before = np.array(all_boundary_jumps_before)
+        jumps_after = np.array(all_boundary_jumps_after)
+        print(f"\n  Boundary jump (L2 norm of first-action delta at chunk boundary, J1-J6):")
+        print(f"    before: mean={jumps_before.mean():.6f}  max={jumps_before.max():.6f}")
+        print(f"    after:  mean={jumps_after.mean():.6f}  max={jumps_after.max():.6f}")
+        reduction = (1.0 - jumps_after.mean() / max(jumps_before.mean(), 1e-10)) * 100
+        print(f"    reduction: {reduction:.1f}%")
+        if jumps_after.mean() >= jumps_before.mean():
+            print(f"    [WARN] Boundary jump NOT reduced! Check blend parameters.")
+
+    # ── Per-joint delta stats ──
+    names = ["J1", "J2", "J3", "J4", "J5", "J6", "Grip"]
+    for d, name in enumerate(names):
+        raw = raw_stack[:, d]
+        smoothed = smoothed_stack[:, d]
+        delta = smoothed - raw
+        max_abs_before = float(np.max(np.abs(np.diff(raw))))
+        max_abs_after = float(np.max(np.abs(np.diff(smoothed))))
+        print(f"  {name:4s}: max_step_delta  before={max_abs_before:.5f}  after={max_abs_after:.5f}"
+              f"  |  mean_abs_delta={np.abs(delta).mean():.6f}")
+
+    # ── Gripper check ──
+    grip_raw = raw_stack[:, 6]
+    grip_smoothed = smoothed_stack[:, 6]
+    grip_delta = grip_smoothed - grip_raw
+    if smooth_gripper:
+        print(f"\n  Gripper smoothing ENABLED — abs_delta_mean={np.abs(grip_delta).mean():.6f}")
+    elif np.abs(grip_delta).max() < 1e-6:
+        print(f"\n  Gripper correctly EXCLUDED from smoothing (max_delta={np.abs(grip_delta).max():.6e})")
+    else:
+        print(f"\n  [WARN] Gripper was modified despite smooth_gripper=False!"
+              f"  max_delta={np.abs(grip_delta).max():.6f}")
+
+    # ── NaN/Inf ──
+    if np.any(np.isnan(smoothed_stack)):
+        print("\n  [FAIL] NaN detected in smoothed output!")
+        return 1
+    if np.any(np.isinf(smoothed_stack)):
+        print("\n  [FAIL] Inf detected in smoothed output!")
+        return 1
+    print("\n  NaN/Inf: none detected")
+
+    print(f"\n  Dry-run PASSED")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpt", type=str, default=None,
@@ -542,7 +773,11 @@ def main():
     parser.add_argument("--can-port", type=str, default="can0")
     parser.add_argument("--velocity-pct", type=int, default=25)
     parser.add_argument("--hz", type=float, default=30.0,
-                        help="Control loop frequency. Keep this equal to dataset fps.")
+                        help="Policy / action-chunk rate. Keep this equal to dataset fps (10 for ACT).")
+    parser.add_argument("--servo-hz", type=float, default=None,
+                        help="Robot command rate. When > --hz, enables dual-rate interpolation: "
+                             "policy advances at --hz, servo commands interpolate at --servo-hz. "
+                             "Must be an integer multiple of --hz. Default: same as --hz.")
     parser.add_argument("--max-steps", type=int, default=APPROACH_STEPS_DEFAULT,
                         help="Maximum action steps for one grasp attempt.")
     parser.add_argument("--test-mode", choices=("A", "B", "C", "D", "full-e2e"), default="A",
@@ -555,6 +790,24 @@ def main():
                         help="Stop ACT after this many steps and begin handover to code control.")
     parser.add_argument("--action-smooth", type=float, default=ACTION_SMOOTH_ALPHA,
                         help="EMA smoothing factor for consecutive action predictions (0=disabled, 0.3=default).")
+    # ── ACT inference-time action smoothing (VA11Hall method) ──
+    parser.add_argument("--enable-act-queue-smoothing", action="store_true",
+                        help="Enable ACT action-queue smoothing: chunk boundary interpolation + mean filter on arm joints (J1-J6).")
+    parser.add_argument("--act-boundary-blend-steps", type=int, default=5,
+                        help="[smoothing] Number of leading steps in a new chunk to linearly blend "
+                             "with the previous chunk's last action (default: 5).")
+    parser.add_argument("--act-mean-filter-window", type=int, default=5,
+                        help="[smoothing] Moving average window size for arm joints J1-J6 (default: 5).")
+    parser.add_argument("--smooth-arm-only", action="store_true", default=True,
+                        help="[smoothing] Only smooth J1-J6, leave gripper untouched (default: True).")
+    parser.add_argument("--smooth-gripper", action="store_true", default=False,
+                        help="[smoothing] Also apply mean filter to gripper. Not recommended — may delay close/release timing.")
+    parser.add_argument("--debug-act-smoothing", action="store_true",
+                        help="[smoothing] Print raw vs smoothed chunk comparison including boundary_jump before/after.")
+    parser.add_argument("--dry-run-act-smoothing", action="store_true",
+                        help="[smoothing] Load checkpoint + dataset frames, compare raw vs smoothed chunk stats, then exit. No robot.")
+    parser.add_argument("--dry-run-smoothing-episodes", type=int, default=3,
+                        help="[smoothing] Number of episodes to load for --dry-run-act-smoothing (default: 3).")
     parser.add_argument("--no-global", action="store_true",
                         help="Disable global camera")
     parser.add_argument("--no-wrist", action="store_true",
@@ -641,6 +894,10 @@ def main():
                         "Prevents image_delta from cancelling state_head forward push.")
     parser.add_argument("--max-joint-delta", type=float, default=None,
                         help="Override per-joint max delta for all arm joints. 0=disabled. Default uses per-joint limits.")
+    parser.add_argument("--max-delta-arm", type=float, default=None,
+                        help="Max delta for J1-J3 (rad). Default: 0.03.")
+    parser.add_argument("--max-delta-wrist", type=float, default=None,
+                        help="Max delta for J4-J6 (rad). Default: 0.012.")
     parser.add_argument("--wrist-freeze-j2", type=float, default=1.45,
                         help="J2 threshold to freeze J4-J6 wrist joints (default: 1.45).")
     parser.add_argument("--ready-j2", type=float, default=1.65,
@@ -718,7 +975,8 @@ def main():
     is_act_full = (args.policy_type == "act-full")
     if (is_act_full and not args.dry_run and not args.allow_real_full_e2e
             and not args.reset_to_recorded_start
-            and not args.debug_offline_policy_rollout_from_recorded_start):
+            and not args.debug_offline_policy_rollout_from_recorded_start
+            and not args.dry_run_act_smoothing):
         parser.error(
             "--policy-type act-full requires --dry-run for safety. "
             "To run on real robot, add --allow-real-full-e2e explicitly."
@@ -795,6 +1053,10 @@ def main():
         max_delta = np.full(6, args.max_joint_delta, dtype=np.float32)
     else:
         max_delta = MAX_DELTA_PER_JOINT.copy()
+        if args.max_delta_arm is not None:
+            max_delta[:3] = args.max_delta_arm
+        if args.max_delta_wrist is not None:
+            max_delta[3:6] = args.max_delta_wrist
 
     print("=" * 60)
     print("  Piper ACT Deployment — Bottle Approach (v0.7.0)")
@@ -1243,6 +1505,35 @@ def main():
         print("\n  Offline debug complete. Exiting without robot connection.")
         return 0
 
+    # ── Dry-run smoothing verification ──
+    if args.dry_run_act_smoothing:
+        dataset_root = None
+        # Try recorded_start_source first
+        if recorded_start_source and "first training frame" in recorded_start_source:
+            dataset_root = recorded_start_source.split(" first training frame")[0]
+        # Fall back to checkpoint train_config.json
+        if dataset_root is None:
+            import json
+            train_cfg_path = os.path.join(str(args.checkpt), "train_config.json")
+            if os.path.isfile(train_cfg_path):
+                with open(train_cfg_path) as f:
+                    train_cfg = json.load(f)
+                dataset_root = train_cfg.get("dataset", {}).get("root")
+        if dataset_root is None:
+            print("[ERROR] Cannot resolve dataset root for smoothing dry-run.")
+            print("  Provide --reset-to-recorded-start or ensure train_config.json has dataset.root")
+            return 1
+        return dry_run_act_smoothing(
+            checkpt_dir=str(args.checkpt),
+            dataset_root=dataset_root,
+            blend_steps=args.act_boundary_blend_steps,
+            mean_filter_window=args.act_mean_filter_window,
+            smooth_arm_only=args.smooth_arm_only,
+            smooth_gripper=args.smooth_gripper,
+            num_episodes=args.dry_run_smoothing_episodes,
+            device="cuda",
+        )
+
     step_n = 2 if args.policy_type in ("hybrid", "hybrid-v3") else 3
     total_n = 3 if args.policy_type in ("hybrid", "hybrid-v3") else 4
     print(f"\n[{step_n}/{total_n}] Connecting Piper ({args.can_port}) ...")
@@ -1492,7 +1783,8 @@ def main():
                 _csv_path = rollout_dir / "step_log.csv"
                 try:
                     _csv_fh = open(str(_csv_path), "w", encoding="utf-8")
-                    _csv_fh.write("step,chunk_id,chunk_idx,current_j1,current_j2,current_j3,current_j4,current_j5,current_j6,current_grip,"
+                    _csv_fh.write("step,chunk_id,chunk_idx,servo_substep,interp_alpha,"
+                                  "current_j1,current_j2,current_j3,current_j4,current_j5,current_j6,current_grip,"
                                   "raw_j1,raw_j2,raw_j3,raw_j4,raw_j5,raw_j6,raw_grip,"
                                   "sent_j1,sent_j2,sent_j3,sent_j4,sent_j5,sent_j6,sent_grip,"
                                   "gripper_pred,gripper_feedback,close_detected,gripper_phase,target_reached,arm_error_active,wrist_frozen\n")
@@ -1508,8 +1800,28 @@ def main():
                 postprocessor.reset()
 
             approach_steps = args.approach_steps
+            # ── Dual-rate execution config ──
+            _policy_hz = args.hz
+            _servo_hz = args.servo_hz if args.servo_hz is not None else _policy_hz
+            if _servo_hz % _policy_hz != 0:
+                print(f"[ERROR] --servo-hz ({_servo_hz}) must be an integer multiple of --hz ({_policy_hz})")
+                return 1
+            _servo_ratio = int(_servo_hz / _policy_hz)
+            _dual_rate = _servo_ratio > 1
+            if _dual_rate:
+                approach_steps = int(approach_steps * _servo_ratio)
+                print(f"\n  ── Dual-Rate Execution ──")
+                print(f"  Policy rate : {_policy_hz} Hz  (chunk_idx advances)")
+                print(f"  Servo rate  : {_servo_hz} Hz  (robot commands)")
+                print(f"  Ratio       : {_servo_ratio}:1  ({_servo_ratio} servo ticks per policy action)")
+                print(f"  Servo steps : {approach_steps}")
+                print(f"  Interp      : linear on J1-J6, gripper NOT interpolated")
             last_smoothed = None
+            last_sent_action = None      # for chunk-boundary smoothing
             last_state = None
+            # dual-rate state
+            _policy_action_cur = None     # action at current chunk_idx
+            _policy_action_nxt = None     # action at chunk_idx+1 (for interpolation)
             raw_actions = []
             paused = False
             user_quit = False
@@ -1558,6 +1870,8 @@ def main():
 
             for step in range(approach_steps):
                 loop_start = time.time()
+                servo_substep = step % _servo_ratio
+                is_policy_tick = (servo_substep == 0 or not _dual_rate)
 
                 # Capture fresh observation
                 wrist_frame = wrist_cam.read() if wrist_cam else None
@@ -1567,7 +1881,7 @@ def main():
                         global_video_writer = create_camera_video_writer(
                             global_frame,
                             _global_video_path,
-                            args.hz,
+                            _servo_hz,
                             "global camera",
                         )
                         if global_video_writer is None:
@@ -1749,7 +2063,17 @@ def main():
 
                     using_held_last = False  # overridden in chunk exec mode
 
-                    if use_chunk_exec:
+                    if use_chunk_exec and not is_policy_tick:
+                        # ── Dual-rate interpolation tick ──
+                        if _policy_action_cur is not None:
+                            model_action = _policy_action_cur.copy()
+                            if _policy_action_nxt is not None and servo_substep > 0:
+                                alpha = servo_substep / _servo_ratio
+                                model_action[:6] = (1.0 - alpha) * _policy_action_cur[:6] + alpha * _policy_action_nxt[:6]
+                        else:
+                            continue
+                        using_held_last = False
+                    elif use_chunk_exec:
                         # ── Chunk execution mode (hold_last_until_ready / target_reached) ──
                         need_new_chunk = (
                             act_chunk is None
@@ -1761,6 +2085,22 @@ def main():
                                 action_chunk = policy.predict_action_chunk(normalized_obs)
                                 action_chunk = postprocessor(action_chunk)
                                 act_chunk = action_chunk.squeeze(0).cpu().numpy()  # (chunk_size, 7)
+
+                            # ── Inference-time action smoothing (VA11Hall method) ──
+                            if args.enable_act_queue_smoothing:
+                                act_chunk = apply_boundary_blend(
+                                    act_chunk,
+                                    last_sent_action,
+                                    blend_steps=args.act_boundary_blend_steps,
+                                    blend_gripper=args.smooth_gripper,
+                                )
+                                act_chunk = apply_mean_filter(
+                                    act_chunk,
+                                    window=args.act_mean_filter_window,
+                                    smooth_arm_only=args.smooth_arm_only,
+                                    smooth_gripper=args.smooth_gripper,
+                                )
+
                             chunk_idx = 0
                             chunk_id += 1
                             holding_last = False
@@ -1778,11 +2118,17 @@ def main():
                             _has_close_candidate = _chunk_grip_min < _close_thresh
                             print(f"  [CHUNK] id={chunk_id}  size={len(act_chunk)}"
                                   f"  J2=[{_chunk_j2_min:.4f}, {_chunk_j2_max:.4f}]"
-                                  f"  first={act_chunk[0][1]:.4f}  last={act_chunk[-1][1]:.4f}")
+                                  f"  first={act_chunk[0][1]:.4f}  last={act_chunk[-1][1]:.4f}"
+                                  f"{'  SMOOTHED' if args.enable_act_queue_smoothing else ''}")
                             print(f"          J3=[{_chunk_j3_min:.4f}, {_chunk_j3_max:.4f}]"
                                   f"  Grip=[{_chunk_grip_min:.4f}, {_chunk_grip_max:.4f}]"
                                   f"  first={act_chunk[0][6]:.4f}  last={act_chunk[-1][6]:.4f}"
                                   f"  close_candidate={_has_close_candidate}")
+                            if _dual_rate and last_sent_action is not None:
+                                _chunk_jump = float(np.linalg.norm(
+                                    np.asarray(act_chunk[0][:6]) - np.asarray(last_sent_action[:6])))
+                                print(f"          boundary_jump (L2, J1-J6): {_chunk_jump:.4f} rad"
+                                      f"{' *** LARGE JUMP ***' if _chunk_jump > 0.1 else ''}")
 
                         if hold_last_mode:
                             # ── hold_last_until_ready ──
@@ -1838,8 +2184,18 @@ def main():
                             else:
                                 model_action = act_chunk[-1].copy()
                                 holding_last = True
+                        # Cache for dual-rate interpolation
+                        if _dual_rate:
+                            _policy_action_cur = model_action.copy()
+                            if hold_last_mode and chunk_idx < len(act_chunk):
+                                _nxt_idx = min(chunk_idx, len(act_chunk) - 1)
+                            else:
+                                _nxt_idx = min(chunk_idx + 1, len(act_chunk) - 1)
+                            _policy_action_nxt = act_chunk[_nxt_idx].copy()
                     else:
                         # ── Normal mode ──
+                        if not is_policy_tick:
+                            continue
                         with torch.inference_mode():
                             normalized_obs = preprocessor(obs)
                             action, _ = select_policy_action(
@@ -1936,6 +2292,10 @@ def main():
                 # Safety clamp to joint limits
                 sent_target[:6] = np.clip(sent_target[:6], -3.14, 3.14)
                 sent_target[6] = np.clip(sent_target[6], 0.0, PIPER_GRIPPER_MAX_M)
+
+                # Update last sent action for chunk-boundary smoothing
+                if args.enable_act_queue_smoothing:
+                    last_sent_action = sent_target.copy()
 
                 # Probe policy reopen intent before the close latch below clamps it.
                 # Requiring a confirmed strong close avoids treating a close-onset
@@ -2041,6 +2401,22 @@ def main():
                             print(f"    close_step={close_step}  consec_close={consecutive_close_count}")
                         if release_detected:
                             print(f"    release_step={release_step}  consec_release={consecutive_release_count}")
+                    if args.enable_act_queue_smoothing:
+                        print(f"    [SMOOTHING] blend={args.act_boundary_blend_steps}  ma={args.act_mean_filter_window}"
+                              f"  arm_only={args.smooth_arm_only}")
+                    if _dual_rate:
+                        _interp_alpha = 0.0 if is_policy_tick else (servo_substep / _servo_ratio)
+                        print(f"    [DUAL-RATE] substep={servo_substep}/{_servo_ratio}"
+                              f"  policy_tick={is_policy_tick}  interp_alpha={_interp_alpha:.2f}"
+                              f"  chunk_id={chunk_id}  chunk_idx={chunk_idx}")
+                        if not is_policy_tick and _policy_action_cur is not None:
+                            print(f"      policy_action_i  = {fmt_vec(_policy_action_cur)}")
+                            if _policy_action_nxt is not None:
+                                print(f"      policy_action_i+1= {fmt_vec(_policy_action_nxt)}")
+                                _interp_jump = float(np.max(np.abs(
+                                    np.asarray(_policy_action_nxt[:6]) - np.asarray(_policy_action_cur[:6]))))
+                                print(f"      boundary_jump    = {_interp_jump:.4f} rad")
+                            print(f"      interpolated     = {fmt_vec(model_action)}")
 
                 # ── Safety stop: joint limit violation ──
                 if np.any(np.abs(sent_target[:6]) > 3.0):
@@ -2129,8 +2505,9 @@ def main():
                     _global_min_grip_pred = min(_global_min_grip_pred, _pred_grip)
                     if _pred_grip < _grip_mid and _first_close_candidate_step < 0:
                         _first_close_candidate_step = step
+                    _interp_alpha = 0.0 if is_policy_tick else (servo_substep / _servo_ratio)
                     _csv_row = (
-                        f"{step},{chunk_id},{chunk_idx},"
+                        f"{step},{chunk_id},{chunk_idx},{servo_substep},{_interp_alpha:.3f},"
                         + ",".join(f"{robot_state_arr[j]:.6f}" for j in range(7))
                         + ","
                         + ",".join(f"{raw_target[j]:.6f}" for j in range(7))
@@ -2193,7 +2570,7 @@ def main():
                             print("  ▶  RESUMED")
 
                 elapsed = time.time() - loop_start
-                step_time = 1.0 / args.hz
+                step_time = 1.0 / _servo_hz
                 if elapsed < step_time:
                     time.sleep(step_time - elapsed)
 
@@ -2209,7 +2586,7 @@ def main():
                         )
                         hold_pos = np.concatenate([last_smoothed, [hold_grip]])
                         robot.set_joint_positions(hold_pos.tolist(), velocity_pct=args.velocity_pct)
-                    time.sleep(1.0 / args.hz)
+                    time.sleep(1.0 / _servo_hz)
                     if not args.no_gui:
                         key = cv2.waitKey(1) & 0xFF
                         if should_quit(key):
@@ -2336,6 +2713,9 @@ def main():
                         print(f"      chunk {cid:2d}: grip=[{gmin:.4f},{gmax:.4f}]"
                               f"  J2=[{j2min:.3f},{j2max:.3f}]  J3=[{j3min:.3f},{j3max:.3f}]"
                               f"  close_candidate={_has}")
+                if args.enable_act_queue_smoothing:
+                    print(f"    Smoothing: blend={args.act_boundary_blend_steps}  ma={args.act_mean_filter_window}"
+                          f"  arm_only={args.smooth_arm_only}")
                 print(f"  {'─' * 40}")
 
             # Close CSV file (always, regardless of phase tracking)
