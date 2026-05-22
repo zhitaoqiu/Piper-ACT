@@ -81,8 +81,19 @@ python3 scripts/adapter_v2_gripper_test.py --can-port can0
 ```
 
 This script asks for explicit confirmation before opening, moving to the safe
-close value, and reopening. It uses torque-retaining disconnect behavior: a
+close value, and reopening. The motion is sent as a small-step sweep with a hold
+at each end so it matches the locally successful close rhythm better than a
+single gripper command. It uses torque-retaining disconnect behavior: a
 gripper-only check must not disable an unsupported arm pose at exit.
+
+For an empty gripper and an obvious close/open sweep during diagnosis:
+
+```bash
+python3 scripts/adapter_v2_gripper_test.py \
+  --can-port can0 \
+  --safe-close 0.000 \
+  --settle-s 1.0
+```
 
 ### Step 3: reset to standard start
 
