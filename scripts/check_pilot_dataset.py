@@ -141,7 +141,9 @@ def camera_episode_counts(
         total_frames = info["total_frames"]
         if not info["files"] or total_frames is None:
             counts[key] = None
-        elif total_frames == expected_total_frames:
+        elif total_frames >= expected_total_frames:
+            # Allow total_frames > expected_total_frames — merged multi-chunk
+            # datasets may have unreferenced video frames from excluded episodes.
             counts[key] = episode_frames
         else:
             counts[key] = -1
@@ -239,7 +241,7 @@ def analyze_episode(
             failures.append(f"{key} missing or unreadable video frames")
         elif count == -1:
             total = camera_info[key]["total_frames"]
-            failures.append(f"{key} total video frames {total} != parquet rows {total_rows}")
+            failures.append(f"{key} total video frames {total} < parquet rows {total_rows}")
         elif count != n_frames:
             failures.append(f"{key} frame count {count} != episode frames {n_frames}")
 

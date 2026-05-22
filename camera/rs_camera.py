@@ -242,6 +242,13 @@ class USBCamera:
                 errors.append(f"{candidate}: opened but read returned no frames")
                 continue
 
+            gray = cv2_module.cvtColor(frame, cv2_module.COLOR_BGR2GRAY)
+            frame_mean = float(gray.mean())
+            if frame_mean < 5.0:
+                cap.release()
+                errors.append(f"{candidate}: black frame (mean={frame_mean:.1f})")
+                continue
+
             self.cap = cap
             self.device_id = candidate
             actual_w = int(cap.get(cv2_module.CAP_PROP_FRAME_WIDTH))

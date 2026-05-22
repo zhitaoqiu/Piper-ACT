@@ -6,9 +6,12 @@ outputs/
 *.ckpt
 
 # Dataset
-data/lerobot_dataset/
+data/lerobot_dataset*/
 *.mp4
 *.parquet
+
+# Frozen assets
+frozen_success/
 
 # Python
 __pycache__/

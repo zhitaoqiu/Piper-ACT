@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
+
+StartGuardMode = Literal["strict", "zone"]
 
 JOINT_NAMES = tuple(f"j{i}" for i in range(1, 7))
 MOTOR_NAMES = JOINT_NAMES + ("gripper",)
@@ -38,6 +41,12 @@ class QposTolerance:
     gripper_m: float = 0.01
 
 
+# Zone mode: per-joint tolerances for interactive data collection.
+# J1–J3 are 0.08 rad, J4–J6 are 0.12 rad, gripper must be open ≥ 0.09 m.
+ZONE_ARM_TOLERANCE_RAD = [0.08, 0.08, 0.08, 0.12, 0.12, 0.12]
+ZONE_GRIPPER_OPEN_MIN_M = 0.09
+
+
 def as_qpos(values, *, label: str = "qpos") -> np.ndarray:
     qpos = np.asarray(values, dtype=np.float32).reshape(-1)
     if qpos.shape != (STATE_DIM,):
@@ -53,7 +62,15 @@ def qpos_to_action(qpos) -> dict[str, float]:
 
 
 def action_to_qpos(action: dict[str, float]) -> np.ndarray:
-    missing = [key for key in MOTOR_POS_KEYS if key not in action]
-    if missing:
-        raise KeyError(f"action missing Piper adapter-v2 keys: {missing}")
-    return as_qpos([action[key] for key in MOTOR_POS_KEYS], label="action")
+    missing_dot = [key for key in MOTOR_POS_KEYS if key not in action]
+    if not missing_dot:
+        return as_qpos([action[key] for key in MOTOR_POS_KEYS], label="action")
+    # Fall back to bare names (e.g. "j1" instead of "j1.pos") from dataset features.
+    bare_keys = {name: idx for idx, name in enumerate(MOTOR_NAMES)}
+    missing_bare = [name for name in MOTOR_NAMES if name not in action]
+    if missing_bare:
+        raise KeyError(
+            f"action missing Piper adapter-v2 keys: {missing_dot} "
+            f"(also tried bare names, missing: {missing_bare})"
+        )
+    return as_qpos([action[name] for name in MOTOR_NAMES], label="action")

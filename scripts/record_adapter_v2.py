@@ -19,7 +19,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from adapter_v2.piper_bus import PiperMotorsBusV2, PiperMotorsBusV2Config
 from adapter_v2.reset import reset_to_standard_start
-from adapter_v2.schema import GLOBAL_CAMERA_KEY, QposTolerance, STANDARD_START_QPOS, as_qpos
+from adapter_v2.schema import (
+    GLOBAL_CAMERA_KEY,
+    QposTolerance,
+    STANDARD_START_QPOS,
+    ZONE_ARM_TOLERANCE_RAD,
+    ZONE_GRIPPER_OPEN_MIN_M,
+    StartGuardMode,
+    as_qpos,
+)
 from adapter_v2.start_pose import qpos_diff, start_pose_guard
 from camera.rs_camera import USBCamera
 from teleop import data_collector as collector
@@ -59,6 +67,23 @@ def parse_qpos(text: str, *, label: str) -> np.ndarray:
     return as_qpos([float(value.strip()) for value in text.split(",")], label=label)
 
 
+def load_start_pose_file(path: str | None) -> np.ndarray | None:
+    if not path:
+        return None
+    file_path = Path(path)
+    if not file_path.exists():
+        print(f"  [WARN] start pose file not found: {file_path}, using schema default.")
+        return None
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+        qpos = as_qpos(data["qpos"], label=f"start pose file {file_path}")
+        print(f"  Loaded start pose from {file_path}: {fmt_qpos(qpos)}")
+        return qpos
+    except Exception as exc:
+        print(f"  [WARN] failed to load start pose file {file_path}: {exc}")
+        return None
+
+
 def fmt_qpos(values: np.ndarray) -> list[float]:
     return [round(float(value), 6) for value in values]
 
@@ -66,25 +91,38 @@ def fmt_qpos(values: np.ndarray) -> list[float]:
 def check_start_guard(
     bus: PiperMotorsBusV2,
     expected: np.ndarray,
-    tolerance: QposTolerance,
+    *,
+    mode: StartGuardMode = "zone",
+    tolerance: QposTolerance = QposTolerance(),
 ) -> StartGuardResult:
     current = bus.read_qpos()
     diff = qpos_diff(current, expected)
-    passed = start_pose_guard(current, expected, tolerance)
+    passed = start_pose_guard(current, expected, mode=mode, tolerance=tolerance)
     result = StartGuardResult(expected, current, diff, tolerance, passed)
     print()
-    print("Start guard:")
+    print(f"Start guard ({mode} mode):")
     print(f"  expected qpos: {fmt_qpos(result.expected)}")
     print(f"  current qpos : {fmt_qpos(result.current)}")
     print(f"  abs diff     : {fmt_qpos(result.diff)}")
-    print(f"  arm tol      : {result.tolerance.arm_rad:.5f} rad")
-    print(f"  gripper tol  : {result.tolerance.gripper_m:.5f} m")
+    if mode == "zone":
+        print(f"  zone J1-J3 tol: {ZONE_ARM_TOLERANCE_RAD[:3]}")
+        print(f"  zone J4-J6 tol: {ZONE_ARM_TOLERANCE_RAD[3:]}")
+        print(f"  zone gripper min open: {ZONE_GRIPPER_OPEN_MIN_M} m")
+    else:
+        print(f"  arm tol      : {result.tolerance.arm_rad:.5f} rad")
+        print(f"  gripper tol  : {result.tolerance.gripper_m:.5f} m")
     if result.passed:
         print("  START GUARD PASS")
     else:
         print("  START GUARD FAIL")
-        print("  Refusing recording. Reset_to_start first.")
-        print("  Reset manually and press C, or press R for confirmed reset_to_standard_start.")
+        print("  Adjust the arm manually, then press C to re-check.")
+        if mode == "zone":
+            per_joint_ok = diff[:6] <= np.asarray(ZONE_ARM_TOLERANCE_RAD, dtype=np.float32)
+            for i in range(6):
+                status = "OK" if per_joint_ok[i] else "EXCEEDED"
+                print(f"    j{i+1}: diff={float(diff[i]):.5f} rad (tol={ZONE_ARM_TOLERANCE_RAD[i]:.4f}) [{status}]")
+            gripper_status = "OK" if float(current[6]) >= ZONE_GRIPPER_OPEN_MIN_M else "TOO CLOSED"
+            print(f"    gripper: {float(current[6]):.5f} m (min={ZONE_GRIPPER_OPEN_MIN_M}) [{gripper_status}]")
     print()
     return result
 
@@ -92,12 +130,24 @@ def check_start_guard(
 def create_global_camera(device_id: str):
     print("\nInitializing adapter-v2 global camera ...")
     collector.print_camera_inventory()
-    return USBCamera(
+    cam = USBCamera(
         device_id=device_id,
         width=collector.GLOBAL_WIDTH,
         height=collector.GLOBAL_HEIGHT,
         fps=collector.GLOBAL_FPS,
     )
+    print(f"  Selected global camera: {cam.device_id}")
+    return cam
+
+
+def is_frame_black(frame, threshold: float = 5.0) -> bool:
+    if frame is None or frame.rgb is None:
+        return True
+    try:
+        gray_mean = float(frame.rgb.mean())
+        return gray_mean < threshold
+    except Exception:
+        return True
 
 
 def create_or_resume_dataset(args):
@@ -126,6 +176,8 @@ def save_episode_start_metadata(
     camera_key: str,
     operator_start_time: str,
     operator_stop_time: str,
+    start_pose_file: str = "",
+    start_guard_mode: str = "zone",
 ) -> Path:
     metadata = {
         "episode_id": int(episode_id),
@@ -137,6 +189,8 @@ def save_episode_start_metadata(
         "camera_key": camera_key,
         "operator_start_time": operator_start_time,
         "operator_stop_time": operator_stop_time,
+        "start_pose_file": start_pose_file,
+        "start_guard_mode": start_guard_mode,
     }
     metadata_dir = dataset_root / "meta" / "adapter_v2_episode_metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -145,7 +199,7 @@ def save_episode_start_metadata(
     return metadata_path
 
 
-def draw_status_preview(cv2, preview, *, state: RecordState, episode_id: int, dry_run: bool):
+def draw_status_preview(cv2, preview, *, state: RecordState, episode_id: int, dry_run: bool, guard_passed: bool = False):
     if preview is None:
         preview = np.zeros((collector.GLOBAL_HEIGHT, collector.GLOBAL_WIDTH, 3), dtype=np.uint8)
         cv2.putText(
@@ -157,11 +211,25 @@ def draw_status_preview(cv2, preview, *, state: RecordState, episode_id: int, dr
             (0, 255, 255),
             2,
         )
+    color = (0, 255, 0) if guard_passed else (0, 255, 255)
     lines = [
         f"adapter v2 {'DRY RUN' if dry_run else 'RECORD'}",
-        f"episode {episode_id + 1} state {state.value}",
-        "SPACE start/stop  ENTER stop  C check  R reset  Q quit",
+        f"episode {episode_id + 1}  state {state.value}",
+        "",
     ]
+    if state in (RecordState.WAIT_FOR_START_GUARD, RecordState.NEXT_EPISODE_START_GUARD):
+        if guard_passed:
+            lines[2] = "GUARD PASS - press SPACE to start recording"
+        else:
+            lines[2] = "C re-check guard  R reset  Q quit"
+    elif state == RecordState.WAIT_FOR_USER_START:
+        lines[2] = "GUARD PASS - press SPACE to start recording  C re-check  Q quit"
+    elif state in (RecordState.WAIT_FOR_USER_STOP,):
+        lines[2] = "SPACE/ENTER stop  (recording in progress)"
+    elif state == RecordState.SAVE_EPISODE:
+        lines[2] = "Saving episode..."
+    else:
+        lines[2] = "SPACE start/stop  C check  R reset  Q quit"
     for index, line in enumerate(lines):
         cv2.putText(
             preview,
@@ -169,7 +237,7 @@ def draw_status_preview(cv2, preview, *, state: RecordState, episode_id: int, dr
             (12, 28 + index * 25),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (0, 255, 0),
+            color,
             2,
         )
     return preview
@@ -208,6 +276,12 @@ def parse_args():
         default="",
         help="Comma-separated [j1,j2,j3,j4,j5,j6,gripper]. Default uses adapter-v2 schema.",
     )
+    parser.add_argument(
+        "--start-guard-mode",
+        choices=("strict", "zone"),
+        default="zone",
+        help="strict: scalar arm/gripper tolerance near STANDARD_START_QPOS. zone: per-joint tolerances J1-J3=0.08,J4-J6=0.12, gripper >= 0.09m (default).",
+    )
     parser.add_argument("--arm-start-tol", type=float, default=0.05)
     parser.add_argument("--gripper-start-tol", type=float, default=0.010)
     parser.add_argument("--dry-run", action="store_true")
@@ -218,6 +292,11 @@ def parse_args():
         help="Always enabled. Recording cannot bypass the adapter-v2 start guard.",
     )
     parser.add_argument("--global-camera", default="auto")
+    parser.add_argument(
+        "--start-pose-file",
+        default="",
+        help="Path to a JSON file with 'qpos' key. Overrides --expected-start-qpos and schema default.",
+    )
     parser.add_argument("--dataset-root", default=str(DEFAULT_DATASET_ROOT))
     parser.add_argument("--dataset-repo-id", default=DEFAULT_DATASET_REPO_ID)
     parser.add_argument("--task", default=DEFAULT_TASK)
@@ -235,22 +314,33 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
-    expected_start = parse_qpos(args.expected_start_qpos, label="--expected-start-qpos")
+    start_pose_from_file = load_start_pose_file(args.start_pose_file)
+    if start_pose_from_file is not None:
+        expected_start = start_pose_from_file
+    else:
+        expected_start = parse_qpos(args.expected_start_qpos, label="--expected-start-qpos")
     tolerance = QposTolerance(args.arm_start_tol, args.gripper_start_tol)
+    start_guard_mode: StartGuardMode = args.start_guard_mode
     cv2 = collector.ensure_opencv()
     collector.check_gui_environment()
 
     print("=" * 72)
     print("Adapter v2 Piper guarded recorder")
     print(f"  mode              : {'dry-run' if args.dry_run else 'record'}")
+    print(f"  start guard mode  : {start_guard_mode}")
     print(f"  can_port          : {args.can_port}")
     print(f"  num_episodes      : {args.num_episodes}")
     print(f"  fps               : {args.fps:.3f}")
     print(f"  camera_key        : {args.camera_key}")
     print("  camera topology   : global camera only, no wrist camera")
     print("  state/action dim  : 7 [j1,j2,j3,j4,j5,j6,gripper]")
+    print(f"  start pose source : {'file=' + args.start_pose_file if start_pose_from_file is not None else 'schema STANDARD_START_QPOS'}")
     print("  start guard       : REQUIRED for every episode")
     print("  reset recording   : forbidden")
+    if start_guard_mode == "zone":
+        print(f"  zone J1-J3 tol    : {ZONE_ARM_TOLERANCE_RAD[:3]}")
+        print(f"  zone J4-J6 tol    : {ZONE_ARM_TOLERANCE_RAD[3:]}")
+        print(f"  zone gripper min  : {ZONE_GRIPPER_OPEN_MIN_M} m")
     print("=" * 72)
 
     bus = PiperMotorsBusV2(PiperMotorsBusV2Config(can_port=args.can_port))
@@ -268,6 +358,7 @@ def main() -> int:
     camera_error_log: dict[str, float] = {}
     global_frame = None
     request_guard_check = True
+    guard_passed = False
 
     try:
         print("\n[1/2] Connecting Piper ...")
@@ -286,9 +377,9 @@ def main() -> int:
 
         print()
         print("Controls:")
-        print("  SPACE        start guarded episode, or stop while recording")
+        print("  C            re-check start guard")
+        print("  SPACE        start recording (only after GUARD PASS), or stop while recording")
         print("  ENTER        stop while recording")
-        print("  C            recheck start guard")
         print("  R            confirmed reset_to_standard_start outside recording")
         print("  Q / ESC      quit")
         print()
@@ -305,15 +396,21 @@ def main() -> int:
                 RecordState.WAIT_FOR_START_GUARD,
                 RecordState.NEXT_EPISODE_START_GUARD,
             ) and request_guard_check:
-                guard_result = check_start_guard(bus, expected_start, tolerance)
+                guard_result = check_start_guard(
+                    bus, expected_start,
+                    mode=start_guard_mode,
+                    tolerance=tolerance,
+                )
                 request_guard_check = False
                 if guard_result.passed:
+                    guard_passed = True
                     state = RecordState.START_GUARD_PASS
                 else:
+                    guard_passed = False
                     state = RecordState.WAIT_FOR_START_GUARD
 
             if state == RecordState.START_GUARD_PASS:
-                print("  Waiting for SPACE. Recording has not started.")
+                print("  GUARD PASS — press SPACE to start recording.")
                 state = RecordState.WAIT_FOR_USER_START
 
             cur_qpos = None
@@ -363,6 +460,7 @@ def main() -> int:
                 state=state,
                 episode_id=episode_id,
                 dry_run=args.dry_run,
+                guard_passed=guard_passed,
             )
             cv2.imshow(window_name, preview)
 
@@ -377,6 +475,7 @@ def main() -> int:
                 if state == RecordState.WAIT_FOR_USER_STOP:
                     print("  [WARN] Stop the active episode before rechecking start guard.")
                 else:
+                    print("  Re-checking start guard ...")
                     state = RecordState.WAIT_FOR_START_GUARD
                     request_guard_check = True
 
@@ -395,11 +494,21 @@ def main() -> int:
                     state = RecordState.SAVE_EPISODE
                 elif state == RecordState.WAIT_FOR_USER_START:
                     # Recheck at the start key so a post-pass manual move cannot bypass the gate.
-                    guard_result = check_start_guard(bus, expected_start, tolerance)
+                    guard_result = check_start_guard(
+                        bus, expected_start,
+                        mode=start_guard_mode,
+                        tolerance=tolerance,
+                    )
                     if not guard_result.passed:
+                        guard_passed = False
                         state = RecordState.WAIT_FOR_START_GUARD
                         request_guard_check = False
+                    elif not args.dry_run and is_frame_black(global_frame):
+                        print("  [WARN] Global camera frame is black. Check camera connection before recording.")
+                        print(f"  Selected device: {global_cam.device_id if global_cam else 'none'}")
+                        guard_passed = True
                     else:
+                        guard_passed = True
                         active_start_guard = guard_result
                         if not args.dry_run:
                             if dataset is None:
@@ -412,7 +521,7 @@ def main() -> int:
                         state = RecordState.RECORDING
                         print(f"  >>> Recording episode {active_episode_id} started.")
                 else:
-                    print("  [WARN] START GUARD PASS is required before SPACE can start recording.")
+                    print("  [WARN] START GUARD PASS is required before SPACE can start recording. Press C to check.")
 
             elif key in (10, 13):
                 if state == RecordState.WAIT_FOR_USER_STOP:
@@ -438,6 +547,8 @@ def main() -> int:
                             camera_key=args.camera_key,
                             operator_start_time=operator_start_time,
                             operator_stop_time=operator_stop_time,
+                            start_pose_file=args.start_pose_file,
+                            start_guard_mode=start_guard_mode,
                         )
                         print(f"  Saved episode {active_episode_id} ({n_frames} frames)")
                         print(f"  Saved start metadata: {metadata_path}")
@@ -452,6 +563,7 @@ def main() -> int:
                 print("  Next episode requires a fresh start guard check.")
                 state = RecordState.NEXT_EPISODE_START_GUARD
                 request_guard_check = True
+                guard_passed = False
 
             elapsed = time.time() - t0
             if elapsed < period:

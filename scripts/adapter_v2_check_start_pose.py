@@ -11,8 +11,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from adapter_v2.piper_bus import PiperMotorsBusV2, PiperMotorsBusV2Config
-from adapter_v2.schema import QposTolerance, STANDARD_START_QPOS, as_qpos
-from adapter_v2.start_pose import qpos_diff, start_pose_guard
+from adapter_v2.schema import (
+    QposTolerance,
+    STANDARD_START_QPOS,
+    StartGuardMode,
+    as_qpos,
+)
+from adapter_v2.start_pose import describe_guard_result, qpos_diff, start_pose_guard
 
 
 def parse_q_start(text: str):
@@ -24,6 +29,12 @@ def parse_q_start(text: str):
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adapter v2 read-only manual start-pose check.")
     parser.add_argument("--can-port", default="can0")
+    parser.add_argument(
+        "--mode",
+        choices=("strict", "zone"),
+        default="strict",
+        help="strict: scalar arm/gripper tolerance. zone: per-joint tolerances.",
+    )
     parser.add_argument("--arm-tol", type=float, default=QposTolerance.arm_rad)
     parser.add_argument("--gripper-tol", type=float, default=QposTolerance.gripper_m)
     parser.add_argument(
@@ -32,6 +43,7 @@ def main() -> int:
         help="Optional comma-separated [j1,j2,j3,j4,j5,j6,gripper] target.",
     )
     args = parser.parse_args()
+    mode: StartGuardMode = args.mode
     q_start = parse_q_start(args.q_start)
     tolerance = QposTolerance(arm_rad=args.arm_tol, gripper_m=args.gripper_tol)
 
@@ -43,14 +55,15 @@ def main() -> int:
         bus.disconnect()
 
     diff = qpos_diff(current, q_start)
-    ok = start_pose_guard(current, q_start, tolerance)
+    ok = start_pose_guard(current, q_start, mode=mode, tolerance=tolerance)
     print("Adapter v2 manual start-pose check")
     print("  motion   : none")
+    print(f"  mode     : {mode}")
     print(f"  can_port : {args.can_port}")
     print(f"  target   : {[round(float(value), 6) for value in q_start]}")
     print(f"  current  : {[round(float(value), 6) for value in current]}")
     print(f"  abs diff : {[round(float(value), 6) for value in diff]}")
-    print(f"  tol      : arm={tolerance.arm_rad:.5f} rad gripper={tolerance.gripper_m:.5f} m")
+    print(f"  details  : {describe_guard_result(current, q_start, mode=mode, tolerance=tolerance)}")
     print(f"RESULT: {'PASS' if ok else 'FAIL - adjust the teaching pose manually'}")
     return 0 if ok else 1
 
