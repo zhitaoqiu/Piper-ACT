@@ -1,5 +1,18 @@
 # VA11Hall Piper + LeRobot Lessons
 
+## 0. Adapter V2 Strategy Update
+
+As of 2026-05-22, the old single-camera 10-demo ACT baseline has succeeded on
+the real Piper arm. VA11Hall is now the primary adapter-v2 architecture
+template, not only a comparison reference. The migration lives on
+`piper-lerobot-adapter-v2` and must leave the successful baseline checkpoint,
+rollouts, videos, and deploy path available as the fallback demonstration.
+
+The adapter-v2 migration should copy the follower/leader/motorbus and standard
+record/replay discipline boldly, while revalidating local joint order, sign,
+units, CAN names, gripper scale, camera devices, reset pose, motion limits, and
+enable/disable behavior on this Piper setup.
+
 参考：
 
 - 知乎专栏：Piper部署ACT模型  
