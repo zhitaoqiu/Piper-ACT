@@ -34,7 +34,7 @@ DEFAULT_MAX_DELTA_RAD = np.asarray([0.030, 0.030, 0.030, 0.012, 0.012, 0.012], d
 
 @dataclass(frozen=True)
 class QposTolerance:
-    arm_rad: float = 0.04
+    arm_rad: float = 0.05
     gripper_m: float = 0.01
 
 

@@ -57,10 +57,12 @@ There is no second leader CAN interface in the current setup. Adapter v2 must
 not block the data path on a software `PiperLeader` teleoperator that this
 hardware topology does not use.
 
-There is also no adapter-v2 automatic reset motion in this teaching flow. The
-operator places the teaching/follower pair near the start pose manually. Code
-may read and check that pose, but it must not drive the follower to `q_start`
-while the teaching arm can command it.
+There is no automatic reset motion in this teaching flow. The guarded recorder
+checks the start pose before every episode. The operator may place the
+teaching/follower pair near the start pose manually and press `C` to recheck, or
+press `R` to request `reset_to_standard_start` outside recording. The `R` path
+requires terminal confirmation and must only be used when the teaching hardware
+state is safe for a commanded follower reset.
 
 ## Stage 1 surface
 
@@ -71,12 +73,14 @@ The first adapter-v2 code lives outside the successful deploy path:
 - `adapter_v2/piper_follower.py`: `piper_follower_v2` LeRobot robot
 - `adapter_v2/piper_leader.py`: retained VA11Hall-style software leader
   scaffolding, not the active local teaching path
-- `adapter_v2/start_pose.py`: manual start-pose guard helpers with no motion
+- `adapter_v2/start_pose.py`: start-pose guard helpers with no motion
+- `adapter_v2/reset.py`: explicit confirmed reset helper for the recorder `R`
+  key outside recording
 - `scripts/adapter_v2_check_start_pose.py`: read-only start-pose comparison
-- `scripts/record_adapter_v2.py`: adapter registration plus standard LeRobot
-  record entrypoint
-- `scripts/record_adapter_v2_mirror.py`: current one-CAN mirror recorder
-  preflighted by the adapter-v2 manual start guard
+- `scripts/record_adapter_v2.py`: current one-CAN guarded recorder that writes
+  LeRobotDataset episodes after a per-episode start guard
+- `scripts/record_adapter_v2_mirror.py`: compatibility alias that forwards to
+  the guarded Stage 1 recorder
 - `scripts/replay_adapter_v2.py`: adapter registration plus standard LeRobot
   replay entrypoint
 
@@ -132,30 +136,35 @@ new manual start target.
 
 ### Step 4: record one demo
 
-Record one single-camera demo only after Step 3 passes. There is no automatic
-reset motion to record; the manually aligned start pose must be ready before
-SPACE starts the saved episode.
-
-The current machine inventory on 2026-05-22 shows only the working `can0`
-interface because the powered teaching arm drives the follower directly. Use
-the single-CAN mirror path for the first one-demo adapter/data validation:
+Run the dry-run first. It connects Piper, prints the qpos start guard, validates
+the key flow, writes no dataset, and sends no reset motion:
 
 ```bash
-python3 scripts/record_adapter_v2_mirror.py \
+python3 scripts/record_adapter_v2.py \
   --can-port can0 \
-  --global-camera auto
+  --dry-run
 ```
 
-This command checks the adapter-v2 manual start guard before opening the
-recorder. It records only `observation.images.global_rgb` and uses the powered
-hardware mirror action source already validated in this repo. Save exactly one
-episode with SPACE, then quit the recorder with Q/ESC. This adapter-v2 mirror
-entrypoint keeps Piper enabled on exit; it must not drop the arm when the
-recording window closes.
+Record one single-camera demo only after the guard flow is clear:
 
-`scripts/record_adapter_v2.py` and `piper_leader_v2` remain reference
-scaffolding for a different software-leader topology. Do not use them for the
-current powered teaching-arm recording flow.
+```bash
+python3 scripts/record_adapter_v2.py \
+  --can-port can0 \
+  --global-camera auto \
+  --num-episodes 1 \
+  --fps 10
+```
+
+The current machine inventory on 2026-05-22 shows only the working `can0`
+interface because the powered teaching arm drives the follower directly. The
+guarded recorder records that one-CAN hardware mirror path. It records only
+`observation.images.global_rgb`, uses 7D `[j1..j6,gripper]` state/action, keeps
+Piper enabled on exit, and saves adapter-v2 start metadata for every episode.
+SPACE can start only after `START GUARD PASS`; SPACE or ENTER stops the episode.
+Before any next episode, the recorder runs the start guard again.
+
+`piper_leader_v2` remains reference scaffolding for a different software-leader
+topology. Do not use it for the current powered teaching-arm recording flow.
 
 ### Step 5: dataset sanity check
 
