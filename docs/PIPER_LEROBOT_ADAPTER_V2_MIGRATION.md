@@ -54,6 +54,8 @@ The first adapter-v2 code lives outside the successful deploy path:
 - `adapter_v2/reset.py`: standard start reset, reset guard, and gripper open
 - `scripts/record_adapter_v2.py`: adapter registration plus standard LeRobot
   record entrypoint
+- `scripts/record_adapter_v2_mirror.py`: current one-CAN mirror recorder
+  preflighted by the adapter-v2 reset guard
 - `scripts/replay_adapter_v2.py`: adapter registration plus standard LeRobot
   replay entrypoint
 
@@ -105,12 +107,29 @@ The default start pose is seeded from the successful 10-demo baseline. Treat it
 as adapter-v2 data only after local reset tolerance passes. Override it with
 `--q-start j1,j2,j3,j4,j5,j6,gripper` when validating a new start pose.
 
-### Step 4: standard record path
+### Step 4: record one demo
 
 Record one single-camera demo only after Step 3 passes. Reset motion must happen
 before `record`; it must not be inside the saved episode.
 
-The standard two-arm software leader command shape is:
+The current machine inventory on 2026-05-22 shows only the working `can0`
+interface. Use the single-CAN mirror path for the first one-demo adapter/data
+validation:
+
+```bash
+python3 scripts/record_adapter_v2_mirror.py \
+  --can-port can0 \
+  --global-camera auto
+```
+
+This command checks the adapter-v2 reset guard before opening the recorder. It
+records only `observation.images.global_rgb` and uses the hardware mirror action
+source already validated in this repo. Save exactly one episode with SPACE, then
+quit the recorder with Q/ESC. This adapter-v2 mirror entrypoint keeps Piper
+enabled on exit; it must not drop the arm when the recording window closes.
+
+The standard two-arm software leader command shape remains the target after a
+separate leader CAN path is validated:
 
 ```bash
 python3 scripts/record_adapter_v2.py \
@@ -127,9 +146,7 @@ python3 scripts/record_adapter_v2.py \
   --dataset.fps=30
 ```
 
-Do not invent a leader CAN name. Validate the actual leader path first. If only
-the current one-CAN mirror mode is available, keep collection on hold for this
-standard-record stage until its action source is explicitly decided.
+Do not invent a leader CAN name. Validate the actual leader path first.
 
 ### Step 5: dataset sanity check
 
@@ -139,7 +156,8 @@ python3 scripts/check_pilot_dataset.py \
   --expected-episodes 1 \
   --min-pass-episodes 1 \
   --require-single-camera \
-  --camera-key observation.images.global_rgb
+  --camera-key observation.images.global_rgb \
+  --expected-start-qpos 0.06292,0.00750,-0.00396,0.02732,0.30946,-0.09826,0.09950
 ```
 
 Check FPS, state/action dims, frames, single camera key, gripper transition,

@@ -193,8 +193,8 @@ def load_lerobot_dataset_class():
         return None
 
 
-def build_dataset_features():
-    return {
+def build_dataset_features(include_wrist: bool = True):
+    features = {
         "observation.state": {
             "dtype": "float32", "shape": (STATE_DIM,),
             "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper"],
@@ -203,13 +203,15 @@ def build_dataset_features():
             "dtype": "float32", "shape": (STATE_DIM,),
             "names": ["j1", "j2", "j3", "j4", "j5", "j6", "gripper"],
         },
-        "observation.images.wrist_rgb": {
-            "dtype": "video", "shape": (3, WRIST_HEIGHT, WRIST_WIDTH),
-        },
         "observation.images.global_rgb": {
             "dtype": "video", "shape": (3, GLOBAL_HEIGHT, GLOBAL_WIDTH),
         },
     }
+    if include_wrist:
+        features["observation.images.wrist_rgb"] = {
+            "dtype": "video", "shape": (3, WRIST_HEIGHT, WRIST_WIDTH),
+        }
+    return features
 
 
 def has_episode_metadata(dataset_root: Path) -> bool:
@@ -227,10 +229,16 @@ def move_incomplete_dataset(dataset_root: Path) -> Path:
     return backup
 
 
-def create_or_resume_dataset(LeRobotDataset, dataset_root: Path, repo_id: str = DATASET_REPO):
+def create_or_resume_dataset(
+    LeRobotDataset,
+    dataset_root: Path,
+    repo_id: str = DATASET_REPO,
+    *,
+    include_wrist: bool = True,
+):
     info_path = dataset_root / "meta" / "info.json"
     tasks_path = dataset_root / "meta" / "tasks.parquet"
-    features = build_dataset_features()
+    features = build_dataset_features(include_wrist=include_wrist)
 
     if info_path.exists() and tasks_path.exists() and has_episode_metadata(dataset_root):
         dataset = LeRobotDataset.resume(repo_id=repo_id, root=dataset_root)
@@ -259,6 +267,13 @@ def dataset_buffer_size(dataset) -> int:
 def clear_dataset_buffer(dataset) -> None:
     if dataset is not None and dataset_buffer_size(dataset) > 0:
         dataset.clear_episode_buffer()
+
+
+def parse_qpos_arg(text: str, *, label: str) -> np.ndarray:
+    qpos = np.asarray([float(value.strip()) for value in text.split(",")], dtype=np.float32)
+    if qpos.shape != (STATE_DIM,) or not np.isfinite(qpos).all():
+        raise ValueError(f"{label} must contain 7 finite values [j1,j2,j3,j4,j5,j6,gripper]")
+    return qpos
 
 
 def should_quit(key: int, window_name: str | None = None) -> bool:
@@ -297,7 +312,7 @@ def parse_args():
     parser.add_argument(
         "--no-wrist",
         action="store_true",
-        help="Skip the wrist RealSense camera. Intended for --camera-only debugging.",
+        help="Skip the wrist RealSense camera and record only observation.images.global_rgb.",
     )
     parser.add_argument(
         "--disable-motion-start-detect",
@@ -338,6 +353,18 @@ def parse_args():
         default=True,
         help="Record real gripper state in action[6] (default: true). Set false to override gripper open.",
     )
+    parser.add_argument(
+        "--keep-enabled-on-exit",
+        action="store_true",
+        help="Do not disable Piper when this recorder exits.",
+    )
+    parser.add_argument(
+        "--required-start-qpos",
+        default="",
+        help="Refuse recording setup unless current [j1..j6,gripper] matches this qpos.",
+    )
+    parser.add_argument("--start-arm-tol", type=float, default=0.04, help="Start guard arm tolerance in rad.")
+    parser.add_argument("--start-gripper-tol", type=float, default=0.01, help="Start guard gripper tolerance in m.")
     return parser.parse_args()
 
 
@@ -465,26 +492,52 @@ def main():
                 global_cam.close()
         return 0
 
-    if args.no_wrist:
-        print("  FAIL: --no-wrist is only supported together with --camera-only.")
-        return 1
-
     # Create cv2 window BEFORE any hardware init, so we can isolate what breaks it
-    window_name = "ACT Data Collector | Wrist (L) + Global (R)"
-    create_preview_window(window_name, 1280, 480)
+    if args.no_wrist:
+        window_name = "ACT Data Collector | Global"
+        create_preview_window(window_name, GLOBAL_WIDTH, GLOBAL_HEIGHT)
+    else:
+        window_name = "ACT Data Collector | Wrist (L) + Global (R)"
+        create_preview_window(window_name, 1280, 480)
     print(f"  Window '{window_name}' created.")
 
     # --- Robot ---
     from hardware.piper_wrapper import PiperRobot
 
     print("\n[1/3] Connecting Piper (can0) ...")
-    robot = PiperRobot(can_port=CAN_PORT, gripper_exist=True)
+    robot = PiperRobot(
+        can_port=CAN_PORT,
+        gripper_exist=True,
+        disable_torque_on_disconnect=not args.keep_enabled_on_exit,
+    )
     try:
         robot.connect()
         print("  Connected.")
     except Exception as e:
         print(f"  FAIL: {e}")
         return 1
+    if args.required_start_qpos:
+        try:
+            expected_start = parse_qpos_arg(args.required_start_qpos, label="--required-start-qpos")
+            current_start = np.asarray(robot.get_joint_positions(), dtype=np.float32)
+        except Exception as e:
+            print(f"  FAIL: start guard setup failed: {e}")
+            robot.disconnect()
+            return 1
+        start_diff = np.abs(current_start - expected_start)
+        start_ok = bool(
+            np.all(start_diff[:6] <= args.start_arm_tol)
+            and start_diff[6] <= args.start_gripper_tol
+        )
+        print("  Start guard:")
+        print(f"    expected: {[round(float(value), 6) for value in expected_start]}")
+        print(f"    current : {[round(float(value), 6) for value in current_start]}")
+        print(f"    abs diff: {[round(float(value), 6) for value in start_diff]}")
+        print(f"    result  : {'PASS' if start_ok else 'FAIL'}")
+        if not start_ok:
+            print("  FAIL: reset to the required start qpos before recording.")
+            robot.disconnect()
+            return 1
 
     # --- Cameras ---
     try:
@@ -498,12 +551,15 @@ def main():
     print("  Warming up cameras ...")
     for i in range(15):
         try:
-            wf = wrist_cam.read()
+            wf = wrist_cam.read() if wrist_cam is not None else None
             gf = global_cam.read()
-            w_mean = float(wf.rgb.mean())
+            w_mean = float(wf.rgb.mean()) if wf is not None else None
             g_mean = float(gf.rgb.mean())
             if i == 0 or i == 14:
-                print(f"  Frame {i+1}: wrist_mean={w_mean:.1f}, global_mean={g_mean:.1f}")
+                if w_mean is None:
+                    print(f"  Frame {i+1}: global_mean={g_mean:.1f}")
+                else:
+                    print(f"  Frame {i+1}: wrist_mean={w_mean:.1f}, global_mean={g_mean:.1f}")
         except Exception as e:
             print(f"  [WARN] Camera warm-up frame {i+1} failed: {e}")
         time.sleep(0.05)
@@ -515,11 +571,17 @@ def main():
     if LeRobotDataset is not None:
         dataset_root = Path(args.dataset_root)
         try:
-            dataset = create_or_resume_dataset(LeRobotDataset, dataset_root, args.dataset_repo_id)
+            dataset = create_or_resume_dataset(
+                LeRobotDataset,
+                dataset_root,
+                args.dataset_repo_id,
+                include_wrist=not args.no_wrist,
+            )
         except Exception as e:
             print(f"  FAIL: {e}")
             robot.disconnect()
-            wrist_cam.close()
+            if wrist_cam is not None:
+                wrist_cam.close()
             global_cam.close()
             return 1
     else:
@@ -580,14 +642,16 @@ def main():
 
             # --- Record (action = next state) ---
             if recording and dataset is not None and cur_state is not None:
-                if prev_state is not None and wrist_frame is not None and global_frame is not None:
+                have_frames = global_frame is not None and (args.no_wrist or wrist_frame is not None)
+                if prev_state is not None and have_frames:
                     frame = {
                         "observation.state": np.array(prev_state, dtype=np.float32),
                         "action": np.array(cur_state, dtype=np.float32),
                         "task": task_str,
-                        "observation.images.wrist_rgb": np.transpose(wrist_frame.rgb, (2, 0, 1)),
                         "observation.images.global_rgb": np.transpose(global_frame.rgb, (2, 0, 1)),
                     }
+                    if wrist_frame is not None:
+                        frame["observation.images.wrist_rgb"] = np.transpose(wrist_frame.rgb, (2, 0, 1))
                     if args.disable_motion_start_detect or motion_started:
                         try:
                             dataset.add_frame(frame)
@@ -634,7 +698,7 @@ def main():
                 now = time.time()
                 if now - last_missing_log > 3.0:
                     reasons = []
-                    if wrist_frame is None:
+                    if not args.no_wrist and wrist_frame is None:
                         reasons.append("wrist frame missing")
                     if global_frame is None:
                         reasons.append("global frame missing")
@@ -708,8 +772,10 @@ def main():
                 print(f"  Done. Episodes: {episode_count}")
             except Exception as e:
                 print(f"  [WARN] {e}")
-        if robot.is_enabled:
+        if robot.is_enabled and not args.keep_enabled_on_exit:
             robot.disable()
+        elif robot.is_enabled:
+            print("  Keeping Piper enabled on exit.")
         robot.disconnect()
         if wrist_cam is not None:
             wrist_cam.close()

@@ -167,6 +167,9 @@ def analyze_episode(
     features: dict[str, Any],
     camera_info: dict[str, dict[str, Any]],
     total_rows: int,
+    expected_start_qpos: np.ndarray | None = None,
+    start_arm_tol: float = 0.04,
+    start_gripper_tol: float = 0.01,
 ) -> tuple[bool, list[str]]:
     n_frames = len(edf)
     failures: list[str] = []
@@ -189,6 +192,7 @@ def analyze_episode(
     onset_candidates = np.where(qgrip < onset_threshold)[0]
     first_onset = int(onset_candidates[0]) if len(onset_candidates) else -1
     lift_present, lift_reason = episode_lift_heuristic(qpos, first_onset)
+    start_diff = None
 
     if n_frames < MIN_FRAMES_PER_EPISODE:
         failures.append(f"frame count too low ({n_frames} < {MIN_FRAMES_PER_EPISODE})")
@@ -200,6 +204,13 @@ def analyze_episode(
         failures.append(f"action dim {action.shape[1]} != {EXPECTED_ACTION_DIM}")
     if not np.isfinite(qpos).all() or not np.isfinite(action).all():
         failures.append("contains NaN or Inf")
+    if expected_start_qpos is not None and qpos.shape[1] == EXPECTED_STATE_DIM:
+        start_diff = np.abs(qpos[0] - expected_start_qpos)
+        if np.any(start_diff[:6] > start_arm_tol) or start_diff[6] > start_gripper_tol:
+            failures.append(
+                "start qpos differs from expected start beyond "
+                f"arm/gripper tolerance ({start_arm_tol:.4f} rad, {start_gripper_tol:.4f} m)"
+            )
     if np.max(np.abs(action)) < 1e-8:
         failures.append("all-zero actions")
     if np.max(np.ptp(action, axis=0)) < 1e-5:
@@ -244,6 +255,8 @@ def analyze_episode(
     print(f"  gripper qpos min/max:   {float(np.nanmin(qgrip)):.5f} / {float(np.nanmax(qgrip)):.5f}")
     print(f"  gripper action min/max: {float(np.nanmin(agrip)):.5f} / {float(np.nanmax(agrip)):.5f}")
     print(f"  first frame gripper value: {first_grip:.5f}")
+    if start_diff is not None:
+        print(f"  start qpos abs diff:       {fmt_vec(start_diff, precision=5)}")
     print(f"  minimum gripper value:     {min_grip:.5f}")
     if first_onset >= 0:
         print(f"  first frame below open - {GRIPPER_ONSET_DROP:.3f}: {first_onset}")
@@ -268,7 +281,31 @@ def main() -> int:
     parser.add_argument("--min-pass-episodes", type=int, default=DEFAULT_MIN_PASS_EPISODES)
     parser.add_argument("--camera-key", default=None, help="Require this exact camera key to exist.")
     parser.add_argument("--require-single-camera", action="store_true", help="Fail unless the dataset has exactly one video camera.")
+    parser.add_argument(
+        "--expected-start-qpos",
+        default="",
+        help="Optional comma-separated [j1,j2,j3,j4,j5,j6,gripper] start pose check.",
+    )
+    parser.add_argument("--start-arm-tol", type=float, default=0.04, help="Start-pose arm tolerance in rad.")
+    parser.add_argument("--start-gripper-tol", type=float, default=0.01, help="Start-pose gripper tolerance in m.")
     args = parser.parse_args()
+
+    expected_start_qpos = None
+    if args.expected_start_qpos:
+        try:
+            expected_start_qpos = np.asarray(
+                [float(value.strip()) for value in args.expected_start_qpos.split(",")],
+                dtype=np.float32,
+            )
+        except ValueError as exc:
+            print(f"[ERROR] Could not parse --expected-start-qpos: {exc}")
+            return 1
+        if expected_start_qpos.shape != (EXPECTED_STATE_DIM,) or not np.isfinite(expected_start_qpos).all():
+            print(
+                "[ERROR] --expected-start-qpos must contain 7 finite values: "
+                "[j1,j2,j3,j4,j5,j6,gripper]"
+            )
+            return 1
 
     dataset_root = Path(args.dataset).expanduser().resolve()
     if not dataset_root.exists():
@@ -327,7 +364,16 @@ def main() -> int:
     failed = 0
     for ep in episodes:
         edf = df[df["episode_index"] == ep].sort_values("frame_index" if "frame_index" in df.columns else "index")
-        ok, _failures = analyze_episode(ep, edf, features, camera_info, len(df))
+        ok, _failures = analyze_episode(
+            ep,
+            edf,
+            features,
+            camera_info,
+            len(df),
+            expected_start_qpos=expected_start_qpos,
+            start_arm_tol=args.start_arm_tol,
+            start_gripper_tol=args.start_gripper_tol,
+        )
         if ok:
             passed += 1
         else:
