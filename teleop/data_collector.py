@@ -535,7 +535,7 @@ def main():
         print(f"    abs diff: {[round(float(value), 6) for value in start_diff]}")
         print(f"    result  : {'PASS' if start_ok else 'FAIL'}")
         if not start_ok:
-            print("  FAIL: reset to the required start qpos before recording.")
+            print("  FAIL: adjust the required start qpos manually before recording.")
             robot.disconnect()
             return 1
 

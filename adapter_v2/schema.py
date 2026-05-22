@@ -21,7 +21,7 @@ GRIPPER_STRONG_CLOSE_MAX_M = 0.055
 PIPER_GRIPPER_MAX_M = 0.101
 
 # Measured by the successful old single-camera 10-demo baseline. Keep this as
-# a seed start pose until adapter-v2 reset validation confirms it locally.
+# the manual start-pose comparison target until adapter-v2 data validates it locally.
 STANDARD_START_QPOS = np.asarray(
     [0.06292, 0.00750, -0.00396, 0.02732, 0.30946, -0.09826, GRIPPER_OPEN_M],
     dtype=np.float32,

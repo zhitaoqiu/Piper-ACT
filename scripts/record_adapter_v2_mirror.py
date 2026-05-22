@@ -25,7 +25,7 @@ def parse_q_start(text: str):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Adapter-v2 one-CAN mirror recorder with reset guard preflight."
+        description="Adapter-v2 one-CAN mirror recorder with manual start guard preflight."
     )
     parser.add_argument("--can-port", default="can0")
     parser.add_argument("--global-camera", default="auto")
@@ -39,20 +39,21 @@ def main() -> int:
     parser.add_argument(
         "--q-start",
         default="",
-        help="Optional comma-separated [j1,j2,j3,j4,j5,j6,gripper] start guard override.",
+        help="Optional comma-separated [j1,j2,j3,j4,j5,j6,gripper] manual start guard target.",
     )
     parser.add_argument(
         "--disable-motion-start-detect",
         action="store_true",
-        help="Forwarded to the mirror recorder. Default keeps reset/idle motion out of the episode.",
+        help="Forwarded to the mirror recorder. Default keeps idle motion out of the episode.",
     )
     args = parser.parse_args()
     q_start = parse_q_start(args.q_start)
 
     print()
     print("Opening single-CAN mirror recorder.")
-    print("  The recorder will enforce the adapter-v2 start guard after Piper connects.")
-    print("  SPACE starts/stops the saved episode after the guarded start pose.")
+    print("  Place the teaching/follower pair near the start pose manually.")
+    print("  The recorder will only check that start pose after Piper connects.")
+    print("  SPACE starts/stops the saved episode after the manual start guard passes.")
     print("  Save one episode, then quit with Q/ESC for adapter-v2 Step 4.")
     print("  Recorder disconnect keeps the v2 guard path torque-retaining.")
     print()

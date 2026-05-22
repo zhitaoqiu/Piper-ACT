@@ -29,7 +29,7 @@ VA11Hall is the primary adapter-v2 architecture template:
 - Piper SDK-backed motor bus
 - LeRobot robot and teleoperator abstractions
 - standard LeRobot `record` and `replay` data path
-- reset before recording and replay
+- manual start alignment before recording and replay
 - dataset checks before training
 - ACT chunk smoothing ideas later in deployment work
 
@@ -57,6 +57,11 @@ There is no second leader CAN interface in the current setup. Adapter v2 must
 not block the data path on a software `PiperLeader` teleoperator that this
 hardware topology does not use.
 
+There is also no adapter-v2 automatic reset motion in this teaching flow. The
+operator places the teaching/follower pair near the start pose manually. Code
+may read and check that pose, but it must not drive the follower to `q_start`
+while the teaching arm can command it.
+
 ## Stage 1 surface
 
 The first adapter-v2 code lives outside the successful deploy path:
@@ -66,11 +71,12 @@ The first adapter-v2 code lives outside the successful deploy path:
 - `adapter_v2/piper_follower.py`: `piper_follower_v2` LeRobot robot
 - `adapter_v2/piper_leader.py`: retained VA11Hall-style software leader
   scaffolding, not the active local teaching path
-- `adapter_v2/reset.py`: standard start reset, reset guard, and gripper open
+- `adapter_v2/start_pose.py`: manual start-pose guard helpers with no motion
+- `scripts/adapter_v2_check_start_pose.py`: read-only start-pose comparison
 - `scripts/record_adapter_v2.py`: adapter registration plus standard LeRobot
   record entrypoint
 - `scripts/record_adapter_v2_mirror.py`: current one-CAN mirror recorder
-  preflighted by the adapter-v2 reset guard
+  preflighted by the adapter-v2 manual start guard
 - `scripts/replay_adapter_v2.py`: adapter registration plus standard LeRobot
   replay entrypoint
 
@@ -112,20 +118,23 @@ python3 scripts/adapter_v2_gripper_test.py \
   --settle-s 1.0
 ```
 
-### Step 3: reset to standard start
+### Step 3: manually align the start pose
 
 ```bash
-python3 scripts/adapter_v2_reset_to_start.py --can-port can0
+python3 scripts/adapter_v2_check_start_pose.py --can-port can0
 ```
 
-The default start pose is seeded from the successful 10-demo baseline. Treat it
-as adapter-v2 data only after local reset tolerance passes. Override it with
-`--q-start j1,j2,j3,j4,j5,j6,gripper` when validating a new start pose.
+This command sends no motion. Place the teaching/follower pair near the start
+pose by hand, run the read-only check, adjust manually if it fails, and rerun.
+The default comparison pose is seeded from the successful 10-demo baseline.
+Override it with `--q-start j1,j2,j3,j4,j5,j6,gripper` only when validating a
+new manual start target.
 
 ### Step 4: record one demo
 
-Record one single-camera demo only after Step 3 passes. Reset motion must happen
-before `record`; it must not be inside the saved episode.
+Record one single-camera demo only after Step 3 passes. There is no automatic
+reset motion to record; the manually aligned start pose must be ready before
+SPACE starts the saved episode.
 
 The current machine inventory on 2026-05-22 shows only the working `can0`
 interface because the powered teaching arm drives the follower directly. Use
@@ -137,12 +146,12 @@ python3 scripts/record_adapter_v2_mirror.py \
   --global-camera auto
 ```
 
-This command checks the adapter-v2 reset guard before opening the recorder. It
-records only `observation.images.global_rgb` and uses the powered hardware
-mirror action source already validated in this repo. Save exactly one episode
-with SPACE, then quit the recorder with Q/ESC. This adapter-v2 mirror entrypoint
-keeps Piper enabled on exit; it must not drop the arm when the recording window
-closes.
+This command checks the adapter-v2 manual start guard before opening the
+recorder. It records only `observation.images.global_rgb` and uses the powered
+hardware mirror action source already validated in this repo. Save exactly one
+episode with SPACE, then quit the recorder with Q/ESC. This adapter-v2 mirror
+entrypoint keeps Piper enabled on exit; it must not drop the arm when the
+recording window closes.
 
 `scripts/record_adapter_v2.py` and `piper_leader_v2` remain reference
 scaffolding for a different software-leader topology. Do not use them for the
@@ -165,10 +174,11 @@ NaN/Inf, and start-pose consistency before training.
 
 ### Step 6: replay the recorded demo
 
-Reset first, then replay the saved one-demo episode:
+Manually return near the episode start and check it before replay. Do not run an
+automatic reset command in this topology:
 
 ```bash
-python3 scripts/adapter_v2_reset_to_start.py --can-port can0
+python3 scripts/adapter_v2_check_start_pose.py --can-port can0
 
 python3 scripts/replay_adapter_v2.py \
   --robot.type=piper_follower_v2 \
