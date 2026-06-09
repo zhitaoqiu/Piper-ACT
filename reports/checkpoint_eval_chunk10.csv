@@ -1,5 +1,0 @@
-checkpoint,checkpoint_path,mean_mse,returncode,status
-010000,outputs/train/piper_bottle_grasp_chunk10/checkpoints/010000/pretrained_model,0.196233,0,ok
-020000,outputs/train/piper_bottle_grasp_chunk10/checkpoints/020000/pretrained_model,0.1926,0,ok
-030000,outputs/train/piper_bottle_grasp_chunk10/checkpoints/030000/pretrained_model,0.191656,0,ok
-last,outputs/train/piper_bottle_grasp_chunk10/checkpoints/last/pretrained_model,0.191656,0,ok

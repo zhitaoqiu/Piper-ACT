@@ -19,7 +19,6 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from hardware.piper_wrapper import PiperRobot
 from camera.rs_camera import RealSenseCamera, USBCamera, find_realsense_devices
 
 PIPER_GRIPPER_MAX_M = 0.101
@@ -120,6 +119,9 @@ def main():
     parser.add_argument("--no-gui", action="store_true")
     parser.add_argument("--training-gripper-min", type=float, default=None)
     parser.add_argument("--training-gripper-max", type=float, default=None)
+    parser.add_argument("--control-backend", choices=("direct_sdk", "ros_mock"), default="direct_sdk",
+                        help="Robot control backend. direct_sdk: real Piper SDK (default). "
+                             "ros_mock: send actions via UDP to ros_bridge ROS nodes (no real hardware).")
     args = parser.parse_args()
 
     # Waypoints
@@ -153,10 +155,18 @@ def main():
     print("  Processors ready.")
 
     # Robot
-    print(f"\n[3/4] Connecting Piper ({args.can_port}) ...")
-    robot = PiperRobot(can_port=args.can_port)
-    robot.connect()  # connect + enable in one call
-    print("  Robot connected.")
+    if args.control_backend == "ros_mock":
+        from ros_bridge.mock_piper_robot import MockPiperRobot
+        print(f"\n[3/4] Initialising ROS mock backend (no real hardware) ...")
+        robot = MockPiperRobot(can_port=args.can_port)
+        robot.connect()
+        print("  [mock] ROS mock backend ready — actions go via UDP to ros_bridge nodes.")
+    else:
+        from hardware.piper_wrapper import PiperRobot  # lazy import — only loaded for real hardware
+        print(f"\n[3/4] Connecting Piper ({args.can_port}) ...")
+        robot = PiperRobot(can_port=args.can_port)
+        robot.connect()  # connect + enable in one call
+        print("  Robot connected.")
 
     # Cameras
     print("\n[4/4] Initializing cameras ...")

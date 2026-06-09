@@ -1,1 +1,0 @@
-step,chunk_id,chunk_idx,current_j1,current_j2,current_j3,current_j4,current_j5,current_j6,current_grip,raw_j1,raw_j2,raw_j3,raw_j4,raw_j5,raw_j6,raw_grip,sent_j1,sent_j2,sent_j3,sent_j4,sent_j5,sent_j6,sent_grip,gripper_pred,gripper_feedback,close_detected,gripper_phase,target_reached,arm_error_active,wrist_frozen

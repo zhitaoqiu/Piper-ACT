@@ -1,2 +1,0 @@
-episode_id,old_len,new_len,removed_prefix,removed_suffix,first_motion,last_motion,delta_horizon_frames,delta_arm_norm_mean,delta_arm_norm_p95,delta_arm_norm_max
-0,236,236,0,0,-1,-1,1,0.02116486243903637,0.0659768134355545,0.10094530135393143

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deploy trained ACT or Hybrid policy on Piper arm for bottle grasping.
+Deploy trained ACT or Hybrid policy on Piper arm for cube grasping.
 
 Usage:
   conda activate piper_act
@@ -33,12 +33,9 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from hardware.piper_wrapper import PiperRobot
-from hardware.config_piper import PiperRobotConfig
 from camera.rs_camera import RealSenseCamera, USBCamera, find_realsense_devices
-from policies.state_conditioned_policy import StateConditionedPolicy
-from policies.state_conditioned_policy_v3 import StateConditionedPolicyV3
-from policies.hybrid_delta_policy import HybridDeltaPolicy
+# Policy classes imported lazily per --policy-type branch below to avoid
+# blocking --help / --control-backend ros_mock when policies/ is unavailable.
 
 PIPER_GRIPPER_MAX_M = 0.101
 DEFAULT_RECORDED_START_QPOS = np.array(
@@ -47,7 +44,7 @@ DEFAULT_RECORDED_START_QPOS = np.array(
 )
 
 # ── Approach-phase constants ──
-GRIPPER_OPEN = 0.08          # gripper fully open (m)
+GRIPPER_OPEN = 0.0995        # gripper fully open (m) — matches cube approach training data
 GRIPPER_CLOSE = 0.0          # gripper fully closed (m)
 # Per-joint max delta: J1-J3 arm joints get 0.03, J4-J6 wrist get 0.012
 MAX_DELTA_PER_JOINT = np.array([0.03, 0.03, 0.03, 0.012, 0.012, 0.012], dtype=np.float32)
@@ -406,6 +403,37 @@ def write_camera_video_frame(writer, frame) -> bool:
     return True
 
 
+def update_scripted_preview(wrist_cam, global_cam, wrist_frame, global_frame,
+                            no_gui: bool, label: str, color=(255, 100, 0),
+                            video_writer=None, video_frame_counter=0):
+    """Read camera frames, update preview window + video writer.
+
+    Call this inside scripted motion loops to keep the UI responsive.
+    Returns (wrist_frame, global_frame, video_frame_counter, user_quit).
+    """
+    user_quit = False
+    if wrist_cam is not None:
+        try:
+            wrist_frame = wrist_cam.read()
+        except Exception:
+            pass
+    if global_cam is not None:
+        try:
+            global_frame = global_cam.read()
+        except Exception:
+            pass
+    if video_writer is not None and global_frame is not None:
+        write_camera_video_frame(video_writer, global_frame)
+        video_frame_counter += 1
+    if not no_gui:
+        preview = build_preview(wrist_frame, global_frame, label, color=color)
+        cv2.imshow("ACT Deployment", preview)
+        key = cv2.waitKey(1) & 0xFF
+        if should_quit(key):
+            user_quit = True
+    return wrist_frame, global_frame, video_frame_counter, user_quit
+
+
 def read_final_camera_frames(wrist_cam, global_cam):
     wrist_frame = None
     global_frame = None
@@ -600,7 +628,7 @@ def apply_mean_filter(chunk: np.ndarray,
     return out
 
 
-def dry_run_act_smoothing(checkpt_dir: str, dataset_root: str,
+def dry_run_act_smoothing(checkpt_dir: str, dataset_root: str, dataset_repo_id: str,
                            blend_steps: int, mean_filter_window: int,
                            smooth_arm_only: bool, smooth_gripper: bool,
                            num_episodes: int, device: str = "cuda") -> int:
@@ -630,7 +658,7 @@ def dry_run_act_smoothing(checkpt_dir: str, dataset_root: str,
     )
 
     print(f"Loading dataset from {dataset_root} ...")
-    ds = LeRobotDataset("piper/bottle_grasp", root=dataset_root)
+    ds = LeRobotDataset(dataset_repo_id, root=dataset_root)
     meta = json.loads(Path(dataset_root, "meta", "info.json").read_text())
     camera_keys = sorted(k for k, v in meta["features"].items()
                          if k.startswith("observation.images.") and v.get("dtype") == "video")
@@ -785,7 +813,14 @@ def main():
     parser.add_argument("--descend-j2-delta", type=float, default=0.04,
                         help="J2 increment (rad) for descent phase in test mode C.")
     parser.add_argument("--place-j1-offset", type=float, default=0.30,
-                        help="J1 offset (rad) to move bottle to side before release (test mode D).")
+                        help="J1 offset (rad) to move cube to side before release (test mode D).")
+    parser.add_argument("--lift-j3-delta", type=float, default=0.10,
+                        help="J3 decrement (rad) for lift phase in test mode D (default: 0.10, more negative = higher lift).")
+    parser.add_argument("--descend-j3-delta", type=float, default=0.06,
+                        help="J3 increment (rad) to lower cube before release in test mode D (default: 0.06).")
+    parser.add_argument("--scripted-place-pose-file", type=str, default=None,
+                        help="Path to JSON file with absolute place qpos (from capture_place_pose.py). "
+                             "When set, TEST-D uses this absolute pose instead of J1-relative offset.")
     parser.add_argument("--approach-steps", type=int, default=APPROACH_STEPS_DEFAULT,
                         help="Stop ACT after this many steps and begin handover to code control.")
     parser.add_argument("--action-smooth", type=float, default=ACTION_SMOOTH_ALPHA,
@@ -957,10 +992,38 @@ def main():
                         help="[act-full + --full-e2e-stop-after release] Control steps to keep "
                              "executing after release onset before the staged release stop. "
                              "Default: 10.")
+    parser.add_argument("--act-full-close-latch", action="store_true",
+                        help="[act-full + full-e2e] After strong close, latch gripper closed and "
+                             "delay release detection for a minimum hold period. Use when the "
+                             "policy reaches the object but fails to hold the cube.")
+    parser.add_argument("--act-full-close-latch-value", type=float, default=0.050,
+                        help="[act-full close-latch] Gripper target value (m) when latched closed. "
+                             "Default: 0.050.")
+    parser.add_argument("--act-full-close-latch-min-hold", type=int, default=50,
+                        help="[act-full close-latch] Minimum steps to hold close latch after "
+                             "strong_close before checking for release. Default: 50 steps (2.5s at 20Hz).")
+    parser.add_argument("--act-full-release-sustain", type=int, default=8,
+                        help="[act-full close-latch] Consecutive raw-prediction steps above "
+                             "release_onset required to confirm release (after min hold). "
+                             "Default: 8 (0.4s at 20Hz).")
+    parser.add_argument("--act-full-j2-clamp", type=float, default=None,
+                        help="[act-full] Maximum allowed J2 (rad) in model action. "
+                             "Clamp action[J2] to <= this value. Default: no clamp.")
+    parser.add_argument("--control-backend", choices=("direct_sdk", "ros_mock"), default="direct_sdk",
+                        help="Robot control backend. direct_sdk: real Piper SDK (default). "
+                             "ros_mock: send actions via UDP to ros_bridge ROS nodes (no real hardware).")
+    parser.add_argument("--obs-backend", choices=("real", "mock"), default="real",
+                        help="Observation backend. real: use physical cameras (default). "
+                             "mock: use fake images + mock robot state — only allowed with "
+                             "--control-backend ros_mock.")
     args = parser.parse_args()
 
     if args.release_stop_min_steps < 0:
         parser.error("--release-stop-min-steps must be >= 0")
+    if args.act_full_close_latch_min_hold < 1:
+        parser.error("--act-full-close-latch-min-hold must be >= 1")
+    if args.act_full_release_sustain < 1:
+        parser.error("--act-full-release-sustain must be >= 1")
 
     if args.no_auto_return:
         args.no_return_to_start = True
@@ -969,6 +1032,10 @@ def main():
     WRIST_FREEZE_J2 = args.wrist_freeze_j2
     READY_J2 = args.ready_j2
     READY_COUNT_MIN = args.ready_count_min
+
+    # Validate obs_backend: mock only allowed with ros_mock control backend
+    if args.obs_backend == "mock" and args.control_backend != "ros_mock":
+        parser.error("--obs-backend mock is only allowed with --control-backend ros_mock")
 
     # Validate act-full safety: dry-run only unless explicitly allowed.
     # Offline debug mode does not use robot, so skip this check.
@@ -1059,7 +1126,7 @@ def main():
             max_delta[3:6] = args.max_delta_wrist
 
     print("=" * 60)
-    print("  Piper ACT Deployment — Bottle Approach (v0.7.0)")
+    print("  Piper ACT Deployment — Cube Approach (v0.8.0)")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1104,6 +1171,10 @@ def main():
 
         if args.v4_j2_only and not is_v4_delta:
             parser.error("--v4-j2-only requires --policy-type hybrid-v4-delta")
+
+        from policies.hybrid_delta_policy import HybridDeltaPolicy
+        from policies.state_conditioned_policy_v3 import StateConditionedPolicyV3
+        from policies.state_conditioned_policy import StateConditionedPolicy
 
         if is_v4_delta:
             policy = HybridDeltaPolicy(
@@ -1508,17 +1579,18 @@ def main():
     # ── Dry-run smoothing verification ──
     if args.dry_run_act_smoothing:
         dataset_root = None
+        dataset_repo_id = "piper/cube_64_global_approach"
         # Try recorded_start_source first
         if recorded_start_source and "first training frame" in recorded_start_source:
             dataset_root = recorded_start_source.split(" first training frame")[0]
         # Fall back to checkpoint train_config.json
         if dataset_root is None:
-            import json
             train_cfg_path = os.path.join(str(args.checkpt), "train_config.json")
             if os.path.isfile(train_cfg_path):
                 with open(train_cfg_path) as f:
                     train_cfg = json.load(f)
                 dataset_root = train_cfg.get("dataset", {}).get("root")
+                dataset_repo_id = train_cfg.get("dataset", {}).get("repo_id", dataset_repo_id)
         if dataset_root is None:
             print("[ERROR] Cannot resolve dataset root for smoothing dry-run.")
             print("  Provide --reset-to-recorded-start or ensure train_config.json has dataset.root")
@@ -1526,6 +1598,7 @@ def main():
         return dry_run_act_smoothing(
             checkpt_dir=str(args.checkpt),
             dataset_root=dataset_root,
+            dataset_repo_id=dataset_repo_id,
             blend_steps=args.act_boundary_blend_steps,
             mean_filter_window=args.act_mean_filter_window,
             smooth_arm_only=args.smooth_arm_only,
@@ -1536,10 +1609,18 @@ def main():
 
     step_n = 2 if args.policy_type in ("hybrid", "hybrid-v3") else 3
     total_n = 3 if args.policy_type in ("hybrid", "hybrid-v3") else 4
-    print(f"\n[{step_n}/{total_n}] Connecting Piper ({args.can_port}) ...")
-    robot = PiperRobot(can_port=args.can_port, disable_torque_on_disconnect=False)
-    robot.connect()  # connect + enable in one call
-    print("  Robot connected and enabled (disable_torque_on_disconnect=False).")
+    if args.control_backend == "ros_mock":
+        from ros_bridge.mock_piper_robot import MockPiperRobot
+        print(f"\n[{step_n}/{total_n}] Initialising ROS mock backend (no real hardware) ...")
+        robot = MockPiperRobot(can_port=args.can_port)
+        robot.connect()
+        print("  [mock] ROS mock backend ready — actions go via UDP to ros_bridge nodes.")
+    else:
+        from hardware.piper_wrapper import PiperRobot  # lazy import — only loaded for real hardware
+        print(f"\n[{step_n}/{total_n}] Connecting Piper ({args.can_port}) ...")
+        robot = PiperRobot(can_port=args.can_port, disable_torque_on_disconnect=False)
+        robot.connect()  # connect + enable in one call
+        print("  Robot connected and enabled (disable_torque_on_disconnect=False).")
 
     # ── Gripper opening on start ──
     gripper_start_open_value = None
@@ -1626,36 +1707,41 @@ def main():
 
     # --- Init cameras ---
     step_n += 1
-    print(f"\n[{step_n}/{total_n}] Initializing cameras ...")
-    if args.policy_type in ("hybrid", "hybrid-v3", "hybrid-v4-delta"):
-        requires_wrist = True
-        requires_global = False
+    if args.obs_backend == "mock":
+        print(f"\n[{step_n}/{total_n}] OBS BACKEND: mock — skipping camera init.")
+        wrist_cam = None
+        global_cam = None
     else:
-        requires_wrist = "observation.images.wrist_rgb" in policy.config.input_features
-        requires_global = "observation.images.global_rgb" in policy.config.input_features
-    if args.no_wrist and requires_wrist:
-        raise ValueError("This policy was trained with wrist_rgb, so --no-wrist cannot be used.")
-    if args.no_global and requires_global:
-        raise ValueError("This policy was trained with global_rgb, so --no-global cannot be used.")
+        print(f"\n[{step_n}/{total_n}] Initializing cameras ...")
+        if args.policy_type in ("hybrid", "hybrid-v3", "hybrid-v4-delta"):
+            requires_wrist = True
+            requires_global = False
+        else:
+            requires_wrist = "observation.images.wrist_rgb" in policy.config.input_features
+            requires_global = "observation.images.global_rgb" in policy.config.input_features
+        if args.no_wrist and requires_wrist:
+            raise ValueError("This policy was trained with wrist_rgb, so --no-wrist cannot be used.")
+        if args.no_global and requires_global:
+            raise ValueError("This policy was trained with global_rgb, so --no-global cannot be used.")
 
-    wrist_cam = None
-    if not args.no_wrist:
-        rs_serials = find_realsense_devices()
-        wrist_serial = rs_serials[0] if rs_serials else ""
-        wrist_cam = RealSenseCamera(serial=wrist_serial, width=640, height=480, fps=30,
-                                    enable_depth=False)
-    else:
-        print("  Wrist camera disabled (--no-wrist).")
+        wrist_cam = None
+        if not args.no_wrist:
+            rs_serials = find_realsense_devices()
+            wrist_serial = rs_serials[0] if rs_serials else ""
+            wrist_cam = RealSenseCamera(serial=wrist_serial, width=640, height=480, fps=30,
+                                        enable_depth=False)
+        else:
+            print("  Wrist camera disabled (--no-wrist).")
 
-    global_cam = None
-    if not args.no_global:
-        try:
-            global_cam = USBCamera(device_id=args.global_camera, width=640, height=480, fps=30)
-        except IOError as e:
-            if requires_global:
-                raise
-            print(f"  Global camera skipped: {e}")
-    print("  Cameras ready.")
+        global_cam = None
+        if not args.no_global:
+            try:
+                global_cam = USBCamera(device_id=args.global_camera, width=640, height=480, fps=30)
+            except IOError as e:
+                if requires_global:
+                    raise
+                print(f"  Global camera skipped: {e}")
+        print("  Cameras ready.")
 
     # --- Gripper distribution check ---
     robot_state = robot.get_joint_positions()
@@ -1842,6 +1928,7 @@ def main():
             release_step = -1
             consecutive_close_count = 0
             consecutive_release_count = 0
+            steps_since_strong_close = 0
             gripper_phase = "open"
             early_gripper_close_warned = False
 
@@ -1894,6 +1981,9 @@ def main():
                 # Build observation
                 wrist_img = wrist_frame.rgb if wrist_frame else None
                 global_img = global_frame.rgb if global_frame else None
+                if args.obs_backend == "mock":
+                    wrist_img = np.zeros((480, 640, 3), dtype=np.uint8)
+                    global_img = np.zeros((480, 640, 3), dtype=np.uint8)
                 if args.save_final_images and rollout_dir is not None and step in (0, 50, 100):
                     save_alignment_images(rollout_dir, f"step_{step:03d}", wrist_frame, global_frame)
 
@@ -2206,6 +2296,10 @@ def main():
                             action = action.squeeze(0)
                         model_action = action.cpu().numpy()
 
+                    # ── apply act-full J2 clamp ──
+                    if args.act_full_j2_clamp is not None and model_action[1] > args.act_full_j2_clamp:
+                        model_action[1] = args.act_full_j2_clamp
+
                     raw_actions.append(model_action.copy())
 
                     # ── Policy I/O debug for ACT ──
@@ -2297,28 +2391,40 @@ def main():
                 if args.enable_act_queue_smoothing:
                     last_sent_action = sent_target.copy()
 
+                # Track steps since strong close for min-hold logic
+                if full_e2e_phase_tracking and strong_close_detected and not release_detected:
+                    steps_since_strong_close += 1
+
                 # Probe policy reopen intent before the close latch below clamps it.
                 # Requiring a confirmed strong close avoids treating a close-onset
                 # rebound as the release phase.
                 policy_grip_before_latch = float(sent_target[6])
                 if (full_e2e_phase_tracking and close_detected and strong_close_detected
                         and not release_detected):
-                    if policy_grip_before_latch > _release_onset_threshold:
-                        consecutive_release_count += 1
-                        if consecutive_release_count >= _close_detect_onset_count:
-                            release_detected = True
-                            release_step = step
-                            print(f"\n  [CLOSE] Release detected at step {step+1}: "
-                                  f"policy_grip={policy_grip_before_latch:.5f} "
-                                  f"> release_onset={_release_onset_threshold:.5f}")
-                    else:
-                        consecutive_release_count = max(0, consecutive_release_count - 1)
+                    # With close-latch: enforce minimum hold before checking release
+                    min_hold = args.act_full_close_latch_min_hold if args.act_full_close_latch else 0
+                    release_sustain = args.act_full_release_sustain if args.act_full_close_latch else _close_detect_onset_count
+                    if steps_since_strong_close >= min_hold:
+                        if policy_grip_before_latch > _release_onset_threshold:
+                            consecutive_release_count += 1
+                            if consecutive_release_count >= release_sustain:
+                                release_detected = True
+                                release_step = step
+                                print(f"\n  [CLOSE] Release detected at step {step+1}: "
+                                      f"policy_grip={policy_grip_before_latch:.5f} "
+                                      f"> release_onset={_release_onset_threshold:.5f} "
+                                      f"(hold={steps_since_strong_close} steps)")
+                        else:
+                            consecutive_release_count = max(0, consecutive_release_count - 1)
 
                 # Gripper close latch: once close is confirmed, prevent policy from
                 # re-opening the gripper before release is detected. This counters the
                 # policy's learned "return to open" behavior within a trajectory chunk.
                 if full_e2e_phase_tracking and close_detected and not release_detected:
-                    sent_target[6] = min(sent_target[6], _close_strong_threshold)
+                    if args.act_full_close_latch and strong_close_detected:
+                        sent_target[6] = min(sent_target[6], args.act_full_close_latch_value)
+                    else:
+                        sent_target[6] = min(sent_target[6], _close_strong_threshold)
 
                 final_step = step + 1
                 final_target = sent_target.copy()
@@ -2357,8 +2463,11 @@ def main():
                                 strong_close_detected = True
                                 print(f"  [CLOSE] Strong close at step {step+1}: grip={pred_grip:.5f} < strong={_close_strong_threshold:.5f}")
 
-                    # Early gripper close safety check (first 30 steps)
-                    if close_detected and step < 30 and not early_gripper_close_warned:
+                    # Early gripper close safety check — only for approach-only modes.
+                    # In full-e2e the model predicts the full trajectory including close
+                    # from step 1, so this check would always trigger.
+                    if close_detected and step < 30 and not early_gripper_close_warned \
+                       and args.full_e2e_stop_after == "approach":
                         print(f"\n  [SAFETY] Early gripper close detected at step {step+1}!")
                         print(f"    gripper_pred={pred_grip:.4f}  onset={_close_onset_threshold:.4f}")
                         early_gripper_close_warned = True
@@ -2682,7 +2791,7 @@ def main():
                 debug_path.write_text(json.dumps(debug_payload, indent=2), encoding="utf-8")
                 print(f"  Saved approach alignment debug JSON: {debug_path}")
                 print("  Please inspect final_realsense.png and final_usb.png:")
-                print("    - Is the gripper center aligned with the bottle center?")
+                print("    - Is the gripper center aligned with the cube center?")
                 print("    - Is the approach height correct?")
                 print("    - Is the gripper orientation correct?")
                 print("    - If not aligned, do not run close/full.")
@@ -2729,7 +2838,7 @@ def main():
             if args.test_mode == "A":
                 if not user_quit:
                     print("  [TEST-A] Approach only — gripper stays open, no close/lift.")
-                    print("  [TEST-A] Check: is gripper aligned with bottle at pre-grasp position?")
+                    print("  [TEST-A] Check: is gripper aligned with cube at pre-grasp position?")
                     final_state = robot.get_joint_positions()
                     print(f"  [TEST-A] Final J2 = {final_state[1]:.5f} rad")
 
@@ -2766,7 +2875,7 @@ def main():
             # ================================================================
             #  TEST MODE C: approach → descend 2-3cm → stop (no close)
             # ================================================================
-            if args.test_mode == "C" and not user_quit and not is_act_full:
+            if args.test_mode == "C" and not user_quit:
                 print(f"\n  >>> [TEST-C] Descending (J2 += {args.descend_j2_delta:.3f} rad) ...")
                 cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
                 descend_pose = cur.copy()
@@ -2800,7 +2909,7 @@ def main():
             # ================================================================
             #  TEST MODE B: close gripper + lift
             # ================================================================
-            if args.test_mode == "B" and not user_quit and not is_act_full:
+            if args.test_mode == "B" and not user_quit:
                 # --- Close gripper ---
                 print(f"\n  >>> [TEST-B] Closing gripper to {GRIPPER_CLOSE:.3f} m ...")
                 cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
@@ -2854,13 +2963,42 @@ def main():
                         robot.set_joint_positions(lift_pose.tolist(), velocity_pct=args.velocity_pct)
                     time.sleep(1.0 / args.hz)
                 print("  Lift complete.")
-                print("  [TEST-B] Verify: is bottle grasped and lifted?")
+                print("  [TEST-B] Verify: is cube grasped and lifted?")
 
             # ================================================================
             #  TEST MODE D: full grasp → place → release → return
             # ================================================================
-            if args.test_mode == "D" and not user_quit and not is_act_full:
-                # --- Close gripper (same as Test B) ---
+            if args.test_mode == "D" and not user_quit:
+                # --- Load absolute place pose if provided ---
+                _place_pose_abs = None
+                if args.scripted_place_pose_file:
+                    try:
+                        _place_data = json.loads(Path(args.scripted_place_pose_file).read_text("utf-8"))
+                        _place_pose_abs = np.asarray(_place_data["qpos"], dtype=np.float32)
+                        print(f"\n  [TEST-D] Using absolute place pose from: {args.scripted_place_pose_file}")
+                        print(f"    place qpos: {fmt_vec(_place_pose_abs, 4)}")
+                    except Exception as exc:
+                        print(f"\n  [WARN] Failed to load place pose file: {exc}")
+                        print("    Falling back to J1-relative offset.")
+                        _place_pose_abs = None
+
+                # Shared camera state (kept live across all scripted phases)
+                _scr_wrist = wrist_frame
+                _scr_global = global_frame
+                _scr_vid_frames = _global_video_frames if args.save_global_video else 0
+                _scr_vid_writer = global_video_writer
+
+                def _scr_preview(label, step_hint=""):
+                    nonlocal _scr_wrist, _scr_global, _scr_vid_frames, _scr_vid_writer
+                    _scr_wrist, _scr_global, _scr_vid_frames, _scr_quit = update_scripted_preview(
+                        wrist_cam, global_cam, _scr_wrist, _scr_global,
+                        args.no_gui, f"[TEST-D] {label} {step_hint}",
+                        video_writer=_scr_vid_writer, video_frame_counter=_scr_vid_frames,
+                    )
+                    return _scr_quit
+
+                # --- Close gripper ---
+                label = "CLOSE"
                 print(f"\n  >>> [TEST-D] Closing gripper to {GRIPPER_CLOSE:.3f} m ...")
                 cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
                 close_pose = cur.copy()
@@ -2873,93 +3011,161 @@ def main():
                         robot.set_joint_positions(ct.tolist(), velocity_pct=args.velocity_pct)
                     if ci == 0 or ci == len(close_path) - 1:
                         print(f"    close {ci+1:3d}/{len(close_path):3d}  grip={ct[6]:.4f}")
+                    if _scr_preview(label, f"{ci+1}/{len(close_path)}"):
+                        user_quit = True; break
                     elapsed = time.time() - t_start
                     s_time = 1.0 / args.hz
                     if elapsed < s_time:
                         time.sleep(s_time - elapsed)
-                hold_start = time.time()
-                print("  Holding close for 0.6s ...")
-                while time.time() - hold_start < 0.6:
-                    if not args.dry_run:
-                        robot.set_joint_positions(close_pose.tolist(), velocity_pct=args.velocity_pct)
-                    time.sleep(1.0 / args.hz)
-                print("  Gripper closed.")
+                if user_quit: pass
+                else:
+                    hold_start = time.time()
+                    print("  Holding close for 0.6s ...")
+                    while time.time() - hold_start < 0.6:
+                        if not args.dry_run:
+                            robot.set_joint_positions(close_pose.tolist(), velocity_pct=args.velocity_pct)
+                        _scr_preview(label, "hold")
+                        time.sleep(1.0 / args.hz)
+                    print("  Gripper closed.")
 
-                # --- Lift: J3 -= 0.06 ---
-                print("\n  >>> [TEST-D] Lifting (J3 -= 0.06 rad) ...")
-                cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
-                lift_pose = cur.copy()
-                lift_pose[2] -= 0.06
-                lift_pose[2] = np.clip(lift_pose[2], -3.14, 3.14)
-                lift_pose[6] = GRIPPER_CLOSE
-                lift_path = interpolate_joint_path(cur, lift_pose,
-                                                   max_step_rad=0.02, max_step_gripper=0.002)
-                for li, lt in enumerate(lift_path):
-                    t_start = time.time()
-                    if not args.dry_run:
-                        robot.set_joint_positions(lt.tolist(), velocity_pct=args.velocity_pct)
-                    if li == 0 or li == len(lift_path) - 1:
-                        print(f"    lift {li+1:3d}/{len(lift_path):3d}  {fmt_vec(lt, 3)}")
-                    elapsed = time.time() - t_start
-                    s_time = 1.0 / args.hz
-                    if elapsed < s_time:
-                        time.sleep(s_time - elapsed)
-                hold_start = time.time()
-                print("  Holding lift for 0.5s ...")
-                while time.time() - hold_start < 0.5:
-                    if not args.dry_run:
-                        robot.set_joint_positions(lift_pose.tolist(), velocity_pct=args.velocity_pct)
-                    time.sleep(1.0 / args.hz)
-                print("  Lift complete.")
+                # --- Lift ---
+                if not user_quit:
+                    lift_delta = args.lift_j3_delta
+                    label = "LIFT"
+                    print(f"\n  >>> [TEST-D] Lifting (J3 -= {lift_delta:.2f} rad) ...")
+                    cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
+                    lift_pose = cur.copy()
+                    lift_pose[2] -= lift_delta
+                    lift_pose[2] = np.clip(lift_pose[2], -3.14, 3.14)
+                    lift_pose[6] = GRIPPER_CLOSE
+                    lift_path = interpolate_joint_path(cur, lift_pose,
+                                                       max_step_rad=0.02, max_step_gripper=0.002)
+                    for li, lt in enumerate(lift_path):
+                        t_start = time.time()
+                        if not args.dry_run:
+                            robot.set_joint_positions(lt.tolist(), velocity_pct=args.velocity_pct)
+                        if li == 0 or li == len(lift_path) - 1:
+                            print(f"    lift {li+1:3d}/{len(lift_path):3d}  {fmt_vec(lt, 3)}")
+                        if _scr_preview(label, f"{li+1}/{len(lift_path)}"):
+                            user_quit = True; break
+                        elapsed = time.time() - t_start
+                        s_time = 1.0 / args.hz
+                        if elapsed < s_time:
+                            time.sleep(s_time - elapsed)
+                    if not user_quit:
+                        hold_start = time.time()
+                        print("  Holding lift for 0.5s ...")
+                        while time.time() - hold_start < 0.5:
+                            if not args.dry_run:
+                                robot.set_joint_positions(lift_pose.tolist(), velocity_pct=args.velocity_pct)
+                            _scr_preview(label, "hold")
+                            time.sleep(1.0 / args.hz)
+                        print("  Lift complete.")
 
-                # --- Place: J1 offset to move bottle to side ---
-                print(f"\n  >>> [TEST-D] Moving to side (J1 += {args.place_j1_offset:.2f} rad) ...")
-                cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
-                place_pose = cur.copy()
-                place_pose[0] += args.place_j1_offset
-                place_pose[0] = np.clip(place_pose[0], -3.14, 3.14)
-                place_pose[6] = GRIPPER_CLOSE
-                place_path = interpolate_joint_path(cur, place_pose,
-                                                    max_step_rad=0.03, max_step_gripper=0.002)
-                for pi, pt in enumerate(place_path):
-                    t_start = time.time()
-                    if not args.dry_run:
-                        robot.set_joint_positions(pt.tolist(), velocity_pct=args.velocity_pct)
-                    if pi == 0 or pi == len(place_path) - 1 or (pi + 1) % 5 == 0:
-                        print(f"    place {pi+1:3d}/{len(place_path):3d}  {fmt_vec(pt, 3)}")
-                    elapsed = time.time() - t_start
-                    s_time = 1.0 / args.hz
-                    if elapsed < s_time:
-                        time.sleep(s_time - elapsed)
-                print("  Moved to side.")
+                # --- Place (absolute pose or J1-relative) ---
+                if not user_quit:
+                    label = "PLACE"
+                    cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
+                    if _place_pose_abs is not None:
+                        place_pose = _place_pose_abs.copy()
+                        place_pose[6] = GRIPPER_CLOSE  # keep gripper closed regardless
+                        print(f"\n  >>> [TEST-D] Moving to absolute place pose ...")
+                        print(f"    target: {fmt_vec(place_pose, 4)}")
+                    else:
+                        place_pose = cur.copy()
+                        place_pose[0] += args.place_j1_offset
+                        place_pose[0] = np.clip(place_pose[0], -3.14, 3.14)
+                        place_pose[6] = GRIPPER_CLOSE
+                        print(f"\n  >>> [TEST-D] Moving to side (J1 += {args.place_j1_offset:.2f} rad) ...")
+                    place_path = interpolate_joint_path(cur, place_pose,
+                                                        max_step_rad=0.03, max_step_gripper=0.002)
+                    for pi, pt in enumerate(place_path):
+                        t_start = time.time()
+                        if not args.dry_run:
+                            robot.set_joint_positions(pt.tolist(), velocity_pct=args.velocity_pct)
+                        if pi == 0 or pi == len(place_path) - 1 or (pi + 1) % 5 == 0:
+                            print(f"    place {pi+1:3d}/{len(place_path):3d}  {fmt_vec(pt, 3)}")
+                        if _scr_preview(label, f"{pi+1}/{len(place_path)}"):
+                            user_quit = True; break
+                        elapsed = time.time() - t_start
+                        s_time = 1.0 / args.hz
+                        if elapsed < s_time:
+                            time.sleep(s_time - elapsed)
+                    if not user_quit:
+                        print("  Place complete.")
 
-                # --- Release: open gripper ---
-                print(f"\n  >>> [TEST-D] Releasing gripper (open to {GRIPPER_OPEN:.3f} m) ...")
-                cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
-                release_pose = cur.copy()
-                release_pose[6] = GRIPPER_OPEN
-                release_path = interpolate_joint_path(cur, release_pose,
-                                                      max_step_rad=0.02, max_step_gripper=0.004)
-                for ri, rt in enumerate(release_path):
-                    t_start = time.time()
-                    if not args.dry_run:
-                        robot.set_joint_positions(rt.tolist(), velocity_pct=args.velocity_pct)
-                    if ri == 0 or ri == len(release_path) - 1:
-                        print(f"    release {ri+1:3d}/{len(release_path):3d}  grip={rt[6]:.4f}")
-                    elapsed = time.time() - t_start
-                    s_time = 1.0 / args.hz
-                    if elapsed < s_time:
-                        time.sleep(s_time - elapsed)
-                print("  Gripper released.")
+                # --- Descend ---
+                if not user_quit:
+                    descend_j3_delta = args.descend_j3_delta
+                    label = "DESCEND"
+                    print(f"\n  >>> [TEST-D] Descending (J3 += {descend_j3_delta:.2f} rad) ...")
+                    cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
+                    descend_pose = cur.copy()
+                    descend_pose[2] += descend_j3_delta
+                    descend_pose[2] = np.clip(descend_pose[2], -3.14, 3.14)
+                    descend_pose[6] = GRIPPER_CLOSE
+                    descend_path = interpolate_joint_path(cur, descend_pose,
+                                                          max_step_rad=0.02, max_step_gripper=0.002)
+                    for di, dt in enumerate(descend_path):
+                        t_start = time.time()
+                        if not args.dry_run:
+                            robot.set_joint_positions(dt.tolist(), velocity_pct=args.velocity_pct)
+                        if di == 0 or di == len(descend_path) - 1 or (di + 1) % 5 == 0:
+                            print(f"    descend {di+1:3d}/{len(descend_path):3d}  {fmt_vec(dt, 3)}")
+                        if _scr_preview(label, f"{di+1}/{len(descend_path)}"):
+                            user_quit = True; break
+                        elapsed = time.time() - t_start
+                        s_time = 1.0 / args.hz
+                        if elapsed < s_time:
+                            time.sleep(s_time - elapsed)
+                    if not user_quit:
+                        hold_start = time.time()
+                        print("  Holding descend for 0.5s ...")
+                        while time.time() - hold_start < 0.5:
+                            if not args.dry_run:
+                                robot.set_joint_positions(descend_pose.tolist(), velocity_pct=args.velocity_pct)
+                            _scr_preview(label, "hold")
+                            time.sleep(1.0 / args.hz)
+                        print("  Descend complete.")
 
-                # Dwell after release
-                hold_start = time.time()
-                print("  Holding release for 0.5s ...")
-                while time.time() - hold_start < 0.5:
-                    if not args.dry_run:
-                        robot.set_joint_positions(release_pose.tolist(), velocity_pct=args.velocity_pct)
-                    time.sleep(1.0 / args.hz)
-                print("  [TEST-D] Full grasp + place + release complete.")
+                # --- Release ---
+                if not user_quit:
+                    release_open_value = act_full_gripper_open
+                    label = "RELEASE"
+                    print(f"\n  >>> [TEST-D] Releasing gripper (open to {release_open_value:.4f} m) ...")
+                    cur = np.asarray(robot.get_joint_positions(), dtype=np.float32)
+                    release_pose = cur.copy()
+                    release_pose[6] = release_open_value
+                    release_path = interpolate_joint_path(cur, release_pose,
+                                                          max_step_rad=0.02, max_step_gripper=0.004)
+                    for ri, rt in enumerate(release_path):
+                        t_start = time.time()
+                        if not args.dry_run:
+                            robot.set_joint_positions(rt.tolist(), velocity_pct=args.velocity_pct)
+                        if ri == 0 or ri == len(release_path) - 1:
+                            print(f"    release {ri+1:3d}/{len(release_path):3d}  grip={rt[6]:.4f}")
+                        if _scr_preview(label, f"{ri+1}/{len(release_path)}"):
+                            user_quit = True; break
+                        elapsed = time.time() - t_start
+                        s_time = 1.0 / args.hz
+                        if elapsed < s_time:
+                            time.sleep(s_time - elapsed)
+                    if not user_quit:
+                        print("  Gripper released.")
+                        hold_start = time.time()
+                        print("  Holding release for 0.5s ...")
+                        while time.time() - hold_start < 0.5:
+                            if not args.dry_run:
+                                robot.set_joint_positions(release_pose.tolist(), velocity_pct=args.velocity_pct)
+                            _scr_preview(label, "hold")
+                            time.sleep(1.0 / args.hz)
+
+                # Update module-level video frame counter for the return-to-start phase
+                if args.save_global_video:
+                    _global_video_frames = _scr_vid_frames
+
+                if not user_quit:
+                    print("  [TEST-D] Full grasp + place + release complete.")
 
             # ================================================================
             #  ALIGNMENT DEBUG HOLD
