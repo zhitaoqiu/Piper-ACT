@@ -2,11 +2,16 @@
 
 End-to-end visuomotor cube grasping on the Piper 7-DoF arm, trained with [ACT](https://github.com/tonyzhaozh/act) (Action Chunking Transformer) via [LeRobot](https://github.com/huggingface/lerobot).
 
-Dual-camera (wrist RealSense D435i + overhead USB), 64 demonstrations, 4 cube positions (2 colors × 2 rotations).
+Dual-camera (wrist RealSense D435i + overhead USB), 4 cube positions (2 colors × 2 rotations).
 
-## Results
+## Final Results
 
-ACT policy successfully grasps cubes at all four positions after 100K training steps (ResNet-18 backbone, chunk size 100, 2× image augmentation).
+<p align="center">
+  <img src="docs/demo_animations/ep0_blue_R0.gif" width="45%" />
+  <img src="docs/demo_animations/ep48_purple_R90.gif" width="45%" />
+</p>
+
+*Top: Global View (overhead USB camera). Bottom: Wrist View (RealSense D435i). 2× speed. Blue block R0° (left) and purple block R90° (right) — diagonal positions in the task grid.*
 
 <p align="center">
   <img src="docs/demo_animations/ep0_blue_R0.gif" width="45%" />
