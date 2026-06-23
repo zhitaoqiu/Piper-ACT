@@ -18,7 +18,7 @@ JOINT_NAMES = [
 
 JOINT_LIMITS = {
     "joint1":   (-2.5, 2.5),
-    "joint2":   (0.0, 2.3),
+    "joint2":   (-0.05, 2.3),
     "joint3":   (-2.8, 0.2),
     "joint4":   (-2.5, 2.5),
     "joint5":   (-1.5, 1.5),

@@ -2,6 +2,23 @@
 
 基于 Piper 双臂（镜像模式）+ ACT 算法的瓶子抓取项目。
 
+## 最终成功展示
+
+ACT 策略在 64 条双摄像头示教数据上训练后，成功在不同位置抓取方块。以下展示对角位置（蓝色 R0 + 紫色 R90）的完整抓取过程，每条均包含全局视角和腕部视角。
+
+<table>
+<tr>
+<td align="center"><b>Blue Block R0</b></td>
+<td align="center"><b>Purple Block R90</b></td>
+</tr>
+<tr>
+<td><img src="docs/demo_animations/ep0_blue_R0.gif" width="100%" /></td>
+<td><img src="docs/demo_animations/ep48_purple_R90.gif" width="100%" /></td>
+</tr>
+</table>
+
+> 上方为全局视角（Global View），下方为腕部视角（Wrist View）。2x 加速播放。训练配置：ACT ResNet18，100K 步，64 条双摄示教数据。
+
 ## 硬件配置
 
 | 组件 | 型号 | 连接方式 | 用途 |

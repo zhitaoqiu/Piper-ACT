@@ -4,10 +4,20 @@ import logging
 import sys
 import time
 from functools import cached_property
+from pathlib import Path
+from typing import TypeAlias
 
-from lerobot.types import RobotAction, RobotObservation
+RobotAction: TypeAlias = dict[str, float]
+RobotObservation: TypeAlias = dict[str, float]
 
-sys.path.insert(0, "/home/huatec/piper_act_bottle_grasp/piper_sdk_py_driver")
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+for _sdk_root in (
+    _PROJECT_ROOT / "piper_sdk_py_driver",
+    Path("/home/huatec/piper_diffusion_bottle_grasp-master/piper_sdk_py_driver"),
+):
+    if (_sdk_root / "piper_sdk_py_driver" / "sdk_adapter.py").exists():
+        sys.path.insert(0, str(_sdk_root))
+        break
 from piper_sdk_py_driver.sdk_adapter import PiperSdkAdapter, JointState, EndPose, ArmStatus
 
 from .config_piper import PiperRobotConfig

@@ -1,0 +1,74 @@
+{
+  "_name": "official_act_single_cube_40",
+  "_notes": [
+    "Separate official LeRobot ACT config for the 40-episode single-cube dataset.",
+    "This intentionally does not reuse the old dim256/chunk10 ACT experiment.",
+    "Architecture values below match LeRobot ACTConfig defaults for this install."
+  ],
+  "dataset": {
+    "repo_id": "piper/single_cube_line4pos_40_clean",
+    "root": "/home/huatec/piper_act_bottle_grasp/data/single_cube_line4pos_40_clean",
+    "episodes": [
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+      10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+      20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+      30, 31, 32, 33, 34, 35, 36, 37, 38, 39
+    ],
+    "image_transforms": {
+      "enable": false
+    },
+    "use_imagenet_stats": true,
+    "video_backend": "pyav",
+    "return_uint8": false,
+    "streaming": false
+  },
+  "policy": {
+    "push_to_hub": false,
+    "type": "act",
+    "n_obs_steps": 1,
+    "input_features": {
+      "observation.state": { "type": "STATE", "shape": [7] },
+      "observation.images.global_rgb": { "type": "VISUAL", "shape": [3, 480, 640] },
+      "observation.images.wrist_rgb": { "type": "VISUAL", "shape": [3, 480, 640] }
+    },
+    "output_features": {
+      "action": { "type": "ACTION", "shape": [7] }
+    },
+    "device": "cuda",
+    "use_amp": false,
+    "chunk_size": 100,
+    "n_action_steps": 100,
+    "normalization_mapping": {
+      "VISUAL": "MEAN_STD",
+      "STATE": "MEAN_STD",
+      "ACTION": "MEAN_STD"
+    },
+    "vision_backbone": "resnet18",
+    "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1",
+    "dim_model": 512,
+    "n_heads": 8,
+    "dim_feedforward": 3200,
+    "feedforward_activation": "relu",
+    "n_encoder_layers": 4,
+    "n_decoder_layers": 1,
+    "dropout": 0.1,
+    "use_vae": true,
+    "latent_dim": 32,
+    "n_vae_encoder_layers": 4,
+    "kl_weight": 10.0,
+    "optimizer_lr": 0.00001,
+    "optimizer_lr_backbone": 0.00001,
+    "optimizer_weight_decay": 0.0001
+  },
+  "output_dir": "/home/huatec/piper_act_bottle_grasp/outputs/train/official_act_single_cube_40",
+  "job_name": "official_act_single_cube_40",
+  "seed": 1000,
+  "num_workers": 8,
+  "batch_size": 8,
+  "prefetch_factor": 4,
+  "steps": 100000,
+  "log_freq": 100,
+  "save_freq": 10000,
+  "use_policy_training_preset": true,
+  "wandb": { "enable": false }
+}

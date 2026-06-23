@@ -21,6 +21,7 @@ Controls:
 """
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -172,30 +173,67 @@ def load_recorded_start_qpos(checkpt: str | None):
     try:
         train_config = json.loads(train_config_path.read_text())
         dataset_cfg = train_config.get("dataset", {})
-        dataset_root = Path(dataset_cfg.get("root", ""))
-        if not dataset_root.is_absolute():
-            dataset_root = PROJECT_ROOT / dataset_root
+        configured_root = Path(dataset_cfg.get("root", ""))
         episodes = dataset_cfg.get("episodes")
 
-        import pandas as pd
+        candidate_roots: list[Path] = []
+        if str(configured_root):
+            dataset_root = configured_root if configured_root.is_absolute() else PROJECT_ROOT / configured_root
+            candidate_roots.append(dataset_root)
+            candidate_roots.append(PROJECT_ROOT / "data" / dataset_root.name)
+            candidate_roots.append(PROJECT_ROOT / "datasets" / dataset_root.name)
+        candidate_roots.append(PROJECT_ROOT / "data" / "single_cube_line4pos_40_clean")
 
-        parquet_paths = sorted((dataset_root / "data").glob("chunk-*/file-*.parquet"))
-        if not parquet_paths:
-            return None, f"no parquet files under {dataset_root / 'data'}"
+        seen: set[Path] = set()
+        errors: list[str] = []
+        for dataset_root in candidate_roots:
+            dataset_root = dataset_root.resolve()
+            if dataset_root in seen:
+                continue
+            seen.add(dataset_root)
+            try:
+                parquet_paths = sorted((dataset_root / "data").glob("chunk-*/file-*.parquet"))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{dataset_root}: {type(exc).__name__}: {exc}")
+                continue
+            if not parquet_paths:
+                errors.append(f"{dataset_root}: no parquet files")
+                continue
 
-        df = pd.concat([pd.read_parquet(path) for path in parquet_paths], ignore_index=True)
-        if episodes:
-            first_episode = int(episodes[0])
-            df = df[df["episode_index"] == first_episode]
-        sort_cols = [col for col in ("episode_index", "frame_index", "index") if col in df.columns]
-        if sort_cols:
-            df = df.sort_values(sort_cols)
-        if df.empty:
-            return None, f"no rows found in {dataset_root}"
-        qpos = np.asarray(df.iloc[0]["observation.state"], dtype=np.float32).reshape(-1)[:7]
-        if qpos.shape[0] != 7:
-            return None, f"recorded start has shape {qpos.shape}, expected 7"
-        return qpos, f"{dataset_root} first training frame"
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+
+                tables = [
+                    pq.read_table(
+                        path,
+                        columns=["observation.state", "episode_index", "frame_index", "index"],
+                    )
+                    for path in parquet_paths
+                ]
+                rows = pa.concat_tables(tables).to_pylist()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{dataset_root}: read failed: {type(exc).__name__}: {exc}")
+                continue
+
+            if episodes:
+                first_episode = int(episodes[0])
+                rows = [row for row in rows if int(row.get("episode_index", -1)) == first_episode]
+            rows.sort(
+                key=lambda row: (
+                    int(row.get("episode_index", 0)),
+                    int(row.get("frame_index", 0)),
+                    int(row.get("index", 0)),
+                )
+            )
+            if not rows:
+                errors.append(f"{dataset_root}: no rows after episode filter")
+                continue
+            qpos = np.asarray(rows[0]["observation.state"], dtype=np.float32).reshape(-1)[:7]
+            if qpos.shape[0] != 7:
+                return None, f"recorded start has shape {qpos.shape}, expected 7"
+            return qpos, f"{dataset_root} first training frame"
+        return None, "no readable local dataset root; " + "; ".join(errors[:4])
     except Exception as exc:
         return None, f"failed to load recorded start: {exc}"
 
@@ -448,6 +486,168 @@ def read_final_camera_frames(wrist_cam, global_cam):
         except Exception as exc:
             print(f"  [WARN] Final USB camera read failed: {exc}")
     return wrist_frame, global_frame
+
+
+def parse_standby_roi(value: str, image_shape) -> tuple[int, int, int, int]:
+    """Parse ROI as x,y,w,h in normalized coordinates or pixels."""
+    h, w = image_shape[:2]
+    parts = [float(part.strip()) for part in value.split(",")]
+    if len(parts) != 4:
+        raise ValueError("--standby-roi must be x,y,w,h")
+    x, y, rw, rh = parts
+    if max(abs(v) for v in parts) <= 1.0:
+        x0 = int(round(x * w))
+        y0 = int(round(y * h))
+        x1 = int(round((x + rw) * w))
+        y1 = int(round((y + rh) * h))
+    else:
+        x0 = int(round(x))
+        y0 = int(round(y))
+        x1 = int(round(x + rw))
+        y1 = int(round(y + rh))
+    x0 = max(0, min(w - 1, x0))
+    y0 = max(0, min(h - 1, y0))
+    x1 = max(x0 + 1, min(w, x1))
+    y1 = max(y0 + 1, min(h, y1))
+    return x0, y0, x1, y1
+
+
+def standby_trigger_scores(rgb: np.ndarray, baseline_rgb: np.ndarray | None, roi, args):
+    x0, y0, x1, y1 = roi
+    crop = rgb[y0:y1, x0:x1]
+    motion_score = 0.0
+    if baseline_rgb is not None and baseline_rgb.shape == rgb.shape:
+        base_crop = baseline_rgb[y0:y1, x0:x1]
+        diff = np.mean(np.abs(crop.astype(np.int16) - base_crop.astype(np.int16)), axis=2)
+        motion_score = float(np.mean(diff > args.standby_motion_threshold))
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    color_mask = (
+        (hsv[:, :, 1] >= args.standby_min_saturation)
+        & (hsv[:, :, 2] >= args.standby_min_value)
+    )
+    color_score = float(np.mean(color_mask))
+    return motion_score, color_score
+
+
+def wait_for_standby_trigger(args, wrist_cam, global_cam) -> bool:
+    """Wait until the global-camera ROI changes enough, or operator presses ENTER."""
+    import select
+
+    if global_cam is None:
+        print("  [STANDBY] Global camera unavailable; press ENTER to trigger, q to quit.")
+
+    baseline_rgb = None
+    baseline_ready_at = time.time() + max(0.0, args.standby_settle_seconds)
+    confirm_count = 0
+    frame_count = 0
+    last_print = 0.0
+    start_time = time.time()
+    roi = None
+
+    print("\n  [STANDBY] Waiting for cube in ROI ...")
+    print("    ENTER = trigger now, q = quit")
+    print(f"    roi={args.standby_roi} mode={args.standby_trigger_mode}"
+          f" confirm={args.standby_confirm_frames}")
+
+    while True:
+        now = time.time()
+        if args.standby_timeout > 0 and now - start_time > args.standby_timeout:
+            print("  [STANDBY] timeout")
+            return False
+
+        if args.no_gui:
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+            except Exception:
+                ready = []
+            if ready:
+                line = sys.stdin.readline()
+                if line == "":
+                    print("  [STANDBY] stdin closed; quit")
+                    return False
+                line = line.strip().lower()
+                if line == "q":
+                    return False
+                if line == "":
+                    print("  [STANDBY] manual ENTER trigger")
+                    return True
+
+        wrist_frame = None
+        global_frame = None
+        if wrist_cam is not None:
+            with contextlib.suppress(Exception):
+                wrist_frame = wrist_cam.read()
+        if global_cam is not None:
+            with contextlib.suppress(Exception):
+                global_frame = global_cam.read()
+
+        motion_score = 0.0
+        color_score = 0.0
+        triggered = False
+        if global_frame is not None and getattr(global_frame, "rgb", None) is not None:
+            rgb = global_frame.rgb
+            if roi is None:
+                roi = parse_standby_roi(args.standby_roi, rgb.shape)
+            if baseline_rgb is None and now >= baseline_ready_at:
+                baseline_rgb = rgb.copy()
+                print("  [STANDBY] baseline captured")
+
+            motion_score, color_score = standby_trigger_scores(rgb, baseline_rgb, roi, args)
+            if args.standby_trigger_mode == "motion":
+                triggered = motion_score >= args.standby_motion_ratio
+            elif args.standby_trigger_mode == "color":
+                triggered = color_score >= args.standby_color_ratio
+            else:
+                triggered = (
+                    motion_score >= args.standby_motion_ratio
+                    or color_score >= args.standby_color_ratio
+                )
+
+            confirm_count = confirm_count + 1 if triggered else 0
+            if confirm_count >= args.standby_confirm_frames:
+                print(f"  [STANDBY] trigger: motion={motion_score:.3f}"
+                      f" color={color_score:.3f} frames={confirm_count}")
+                if args.standby_trigger_delay > 0:
+                    time.sleep(args.standby_trigger_delay)
+                return True
+
+            if not args.no_gui:
+                preview = build_preview(
+                    wrist_frame,
+                    global_frame,
+                    f"STANDBY m={motion_score:.3f} c={color_score:.3f}",
+                    color=(0, 180, 255),
+                )
+                if roi is not None and global_frame is not None:
+                    x0, y0, x1, y1 = roi
+                    # If wrist and global are stacked, ROI is on the right half.
+                    x_offset = 0
+                    if wrist_frame is not None:
+                        x_offset = preview.shape[1] // 2
+                        scale_x = (preview.shape[1] // 2) / rgb.shape[1]
+                        scale_y = preview.shape[0] / rgb.shape[0]
+                    else:
+                        scale_x = preview.shape[1] / rgb.shape[1]
+                        scale_y = preview.shape[0] / rgb.shape[0]
+                    p0 = (int(x_offset + x0 * scale_x), int(y0 * scale_y))
+                    p1 = (int(x_offset + x1 * scale_x), int(y1 * scale_y))
+                    cv2.rectangle(preview, p0, p1, (0, 180, 255), 2)
+                cv2.imshow("ACT Deployment", preview)
+                key = cv2.waitKey(1) & 0xFF
+                if should_quit(key):
+                    return False
+                if key in (ord(" "), 13):
+                    print("  [STANDBY] manual key trigger")
+                    return True
+
+        if now - last_print > 1.0:
+            last_print = now
+            print(f"  [STANDBY] frame={frame_count} motion={motion_score:.3f}"
+                  f" color={color_score:.3f} confirm={confirm_count}/{args.standby_confirm_frames}")
+
+        frame_count += 1
+        time.sleep(1.0 / max(1.0, args.standby_poll_hz))
 
 
 def policy_state_dim(policy) -> int:
@@ -873,6 +1073,32 @@ def main():
                         help="If abs(raw_gripper) > deadband but abs(scaled) < min, override to min_gripper_delta.")
     parser.add_argument("--no-gui", action="store_true",
                         help="Disable cv2 GUI windows; use terminal input (Enter=grasp, q=quit).")
+    parser.add_argument("--standby-auto-trigger", action="store_true",
+                        help="Wait in standby and trigger rollout automatically when the global-camera ROI changes.")
+    parser.add_argument("--standby-roi", default="0.30,0.38,0.40,0.38",
+                        help="Global-camera trigger ROI as x,y,w,h. Values <=1 are normalized; otherwise pixels.")
+    parser.add_argument("--standby-trigger-mode", choices=("motion", "color", "either"), default="motion",
+                        help="motion: compare ROI to empty baseline; color: saturated object in ROI; either: either condition.")
+    parser.add_argument("--standby-motion-threshold", type=int, default=28,
+                        help="Per-pixel RGB-difference threshold for standby motion trigger.")
+    parser.add_argument("--standby-motion-ratio", type=float, default=0.04,
+                        help="Fraction of ROI pixels that must change for motion trigger.")
+    parser.add_argument("--standby-color-ratio", type=float, default=0.08,
+                        help="Fraction of saturated ROI pixels required for color trigger.")
+    parser.add_argument("--standby-min-saturation", type=int, default=65,
+                        help="HSV saturation threshold for color trigger.")
+    parser.add_argument("--standby-min-value", type=int, default=40,
+                        help="HSV value threshold for color trigger.")
+    parser.add_argument("--standby-confirm-frames", type=int, default=5,
+                        help="Consecutive trigger frames required before rollout starts.")
+    parser.add_argument("--standby-poll-hz", type=float, default=8.0,
+                        help="Camera polling rate while waiting in standby.")
+    parser.add_argument("--standby-settle-seconds", type=float, default=1.0,
+                        help="Delay before capturing the empty baseline after returning to standby.")
+    parser.add_argument("--standby-trigger-delay", type=float, default=0.2,
+                        help="Delay after trigger confirmation before starting rollout.")
+    parser.add_argument("--standby-timeout", type=float, default=0.0,
+                        help="Optional standby timeout in seconds. 0 means wait forever.")
     parser.add_argument("--gripper-unit-scale", type=float, default=1.0,
                         help="Scale robot gripper state before feeding to policy, "
                              "and inverse-scale the target back before sending to robot.")
@@ -905,8 +1131,12 @@ def main():
                         help="[debug] Inspect recorded dataset gripper trajectory and exit. No robot connection.")
     parser.add_argument("--enforce-start-reset", action="store_true",
                         help="Refuse rollout unless current qpos/gripper match the recorded training start.")
+    parser.add_argument("--auto-reset-on-guard-fail", action="store_true",
+                        help="When --enforce-start-reset fails, move to the recorded start and continue instead of waiting.")
     parser.add_argument("--reset-to-recorded-start", action="store_true",
                         help="Move to the recorded training start, validate reset guard, then exit before rollout.")
+    parser.add_argument("--start-qpos", default="",
+                        help="Override recorded start qpos: j1,j2,j3,j4,j5,j6,grip (comma-separated).")
     parser.add_argument("--start-qpos-tol", type=float, default=0.05,
                         help="Arm joint tolerance for --enforce-start-reset.")
     parser.add_argument("--start-gripper-tol", type=float, default=0.01,
@@ -970,6 +1200,22 @@ def main():
                         help="[act-full + target_reached] Exclude frozen wrist joints (J4-J6) from arm_error "
                              "when wrist_freeze is active. Prevents wrist freeze from blocking chunk_idx advance. "
                              "Default: True.")
+    parser.add_argument("--min-steps-before-stagnation", type=int, default=80,
+                        help="Minimum control steps before stagnation stop is allowed. "
+                             "Stagnation is suppressed until this many steps have elapsed. "
+                             "Default: 80.")
+    parser.add_argument("--disable-stagnation-before-close", action="store_true", default=True,
+                        help="[act-full] Suppress stagnation stop while close_detected=False. "
+                             "Prevents premature stagnation when the model predicts a slow approach "
+                             "before the close/lift phase. Default: True.")
+    parser.add_argument("--debug-drain-first-chunk", action="store_true",
+                        help="[act-full + full-e2e] Generate the first ACT chunk then simulate executing "
+                             "every action in sequence without re-querying the policy. "
+                             "ALWAYS dry-run: no action is sent to the robot. "
+                             "Use --allow-hardware-action to override (DANGER: only for controlled testing).")
+    parser.add_argument("--allow-hardware-action", action="store_true",
+                        help="EXPLICIT DANGER FLAG. Required alongside --debug-drain-first-chunk to "
+                             "actually send actions to the robot. Without this, drain mode is dry-run.")
     parser.add_argument("--gripper-close-detect-mode", choices=("absolute", "relative", "dataset"), default="relative",
                         help="[act-full] Gripper close detection mode. "
                              "absolute: grip < (open+close)/2. "
@@ -1012,6 +1258,11 @@ def main():
     parser.add_argument("--control-backend", choices=("direct_sdk", "ros_mock"), default="direct_sdk",
                         help="Robot control backend. direct_sdk: real Piper SDK (default). "
                              "ros_mock: send actions via UDP to ros_bridge ROS nodes (no real hardware).")
+    parser.add_argument("--state-backend", choices=("mock", "real_ros"), default="mock",
+                        help="Joint-state source (only used with --control-backend ros_mock). "
+                             "mock: track local qpos from sent actions (default). "
+                             "real_ros: read real /piper/joint_states via UDP bridge "
+                             "(requires ros_state_udp_publisher_node).")
     parser.add_argument("--obs-backend", choices=("real", "mock"), default="real",
                         help="Observation backend. real: use physical cameras (default). "
                              "mock: use fake images + mock robot state — only allowed with "
@@ -1027,6 +1278,12 @@ def main():
 
     if args.no_auto_return:
         args.no_return_to_start = True
+    if args.standby_auto_trigger and args.no_global:
+        parser.error("--standby-auto-trigger requires the global camera; do not use --no-global")
+    if args.standby_confirm_frames < 1:
+        parser.error("--standby-confirm-frames must be >= 1")
+    if args.standby_poll_hz <= 0:
+        parser.error("--standby-poll-hz must be > 0")
 
     # Apply command-line overrides to shared constants
     WRIST_FREEZE_J2 = args.wrist_freeze_j2
@@ -1036,6 +1293,9 @@ def main():
     # Validate obs_backend: mock only allowed with ros_mock control backend
     if args.obs_backend == "mock" and args.control_backend != "ros_mock":
         parser.error("--obs-backend mock is only allowed with --control-backend ros_mock")
+    # Validate state_backend: real_ros only allowed with ros_mock control backend
+    if args.state_backend == "real_ros" and args.control_backend != "ros_mock":
+        parser.error("--state-backend real_ros is only allowed with --control-backend ros_mock")
 
     # Validate act-full safety: dry-run only unless explicitly allowed.
     # Offline debug mode does not use robot, so skip this check.
@@ -1061,6 +1321,12 @@ def main():
     recorded_start_source = ""
     if is_act_full or args.enforce_start_reset or args.reset_to_recorded_start:
         recorded_start_qpos, recorded_start_source = resolve_recorded_start_qpos(args.checkpt)
+    if args.start_qpos:
+        parts = [float(x.strip()) for x in args.start_qpos.split(",")]
+        if len(parts) != 7:
+            parser.error("--start-qpos must have 7 comma-separated values: j1,j2,j3,j4,j5,j6,grip")
+        recorded_start_qpos = np.array(parts, dtype=np.float32)
+        recorded_start_source = "--start-qpos override"
     act_full_gripper_open = GRIPPER_OPEN
     if is_act_full:
         if recorded_start_qpos is not None:
@@ -1611,8 +1877,10 @@ def main():
     total_n = 3 if args.policy_type in ("hybrid", "hybrid-v3") else 4
     if args.control_backend == "ros_mock":
         from ros_bridge.mock_piper_robot import MockPiperRobot
-        print(f"\n[{step_n}/{total_n}] Initialising ROS mock backend (no real hardware) ...")
-        robot = MockPiperRobot(can_port=args.can_port)
+        use_real = (args.state_backend == "real_ros")
+        print(f"\n[{step_n}/{total_n}] Initialising ROS mock backend "
+              f"(state={args.state_backend}) ...")
+        robot = MockPiperRobot(can_port=args.can_port, use_real_state=use_real)
         robot.connect()
         print("  [mock] ROS mock backend ready — actions go via UDP to ros_bridge nodes.")
     else:
@@ -1757,7 +2025,10 @@ def main():
                   f" [{args.training_gripper_min:.3f}, {args.training_gripper_max:.3f}].")
 
     print("\n" + "-" * 60)
-    print("  SPACE = run approach    Q/ESC = quit")
+    if args.standby_auto_trigger:
+        print("  STANDBY = auto trigger from ROI    ENTER = manual trigger    q = quit")
+    else:
+        print("  SPACE = run approach    Q/ESC = quit")
     print(f"  TEST MODE: {args.test_mode}  |  APPROACH STEPS: {args.approach_steps}"
           f"  |  SMOOTH: α={args.action_smooth}")
     print(f"  Per-joint max_delta: J1-J3={max_delta[0]:.3f}  J4-J6={max_delta[3]:.3f} rad")
@@ -1795,6 +2066,11 @@ def main():
         print("  FINAL IMAGE DEBUG: enabled")
     if args.save_global_video:
         print(f"  GLOBAL VIDEO: active rollout view will save at {args.hz:.1f}fps")
+    if args.standby_auto_trigger:
+        print(f"  STANDBY AUTO TRIGGER: roi={args.standby_roi}"
+              f" mode={args.standby_trigger_mode}"
+              f" motion_ratio={args.standby_motion_ratio:.3f}"
+              f" confirm={args.standby_confirm_frames}")
     if recorded_start_qpos is not None:
         print(f"  Reset guard expected start: {fmt_vec(recorded_start_qpos, 5)}")
         print(f"  Reset guard source: {recorded_start_source}")
@@ -1811,7 +2087,11 @@ def main():
     try:
         while True:
             # --- Live preview ---
-            if args.no_gui:
+            if args.standby_auto_trigger:
+                should_start = wait_for_standby_trigger(args, wrist_cam, global_cam)
+                if not should_start:
+                    break
+            elif args.no_gui:
                 cmd = input("  Press ENTER to run approach, Q then ENTER to quit: ").strip().lower()
                 if cmd == "q":
                     break
@@ -1842,12 +2122,41 @@ def main():
                     args.start_qpos_tol,
                     args.start_gripper_tol,
                 ):
-                    print("  Reset guard failed. Waiting for the next SPACE after you reset the arm.")
-                    if args.no_gui:
-                        time.sleep(0.5)
+                    if args.auto_reset_on_guard_fail and not args.dry_run:
+                        print("  Reset guard failed. Auto-resetting to recorded start before rollout ...")
+                        if gripper_start_open_value is not None:
+                            grip_ok, *_ = open_gripper_to_value(
+                                robot=robot,
+                                target_gripper=gripper_start_open_value,
+                                timeout=args.gripper_open_timeout,
+                                tol=args.gripper_open_tol,
+                                hz=args.hz,
+                            )
+                            if not grip_ok:
+                                print("  [RESET-GUARD] Gripper auto-reset failed. Waiting for next trigger.")
+                                continue
+                        passed, final_qpos, _ = move_robot_to_recorded_start(
+                            robot=robot,
+                            target_qpos=recorded_start_qpos,
+                            velocity_pct=args.velocity_pct,
+                            hz=args.hz,
+                            max_delta=max_delta,
+                            action_smooth=args.action_smooth,
+                            qpos_tol=args.start_qpos_tol,
+                            gripper_tol=args.start_gripper_tol,
+                        )
+                        if not passed:
+                            print("  [RESET-GUARD] Auto-reset failed. Waiting for next trigger.")
+                            continue
+                        start_robot_state = np.asarray(final_qpos, dtype=np.float32)
+                        print("  Reset guard auto-reset complete. Starting rollout.")
                     else:
-                        cv2.waitKey(750)
-                    continue
+                        print("  Reset guard failed. Waiting for the next SPACE after you reset the arm.")
+                        if args.no_gui:
+                            time.sleep(0.5)
+                        else:
+                            cv2.waitKey(750)
+                        continue
 
             # Setup rollout saving directory
             rollout_dir = None
@@ -1873,7 +2182,10 @@ def main():
                                   "current_j1,current_j2,current_j3,current_j4,current_j5,current_j6,current_grip,"
                                   "raw_j1,raw_j2,raw_j3,raw_j4,raw_j5,raw_j6,raw_grip,"
                                   "sent_j1,sent_j2,sent_j3,sent_j4,sent_j5,sent_j6,sent_grip,"
-                                  "gripper_pred,gripper_feedback,close_detected,gripper_phase,target_reached,arm_error_active,wrist_frozen\n")
+                                  "gripper_pred,gripper_feedback,close_detected,gripper_phase,target_reached,arm_error_active,wrist_frozen,"
+                                  "gate_raw_grip,gate_after_denorm,gate_after_clamp,gate_after_safety,gate_final,"
+                                  "gate_was_forced_open,gate_was_clamped,gate_clamp_reason,"
+                                  "raw_close_detected,final_close_detected,stagnation_suppressed\n")
                 except OSError as e:
                     print(f"  [WARN] Could not open CSV for writing: {e}")
                     print(f"  [WARN] Per-step CSV logging disabled for this rollout.")
@@ -1954,6 +2266,48 @@ def main():
             _first_close_candidate_step = -1       # first step where grip_pred < grip_mid
             _total_chunks_generated = 0
             _chunk_history = []                   # (chunk_id, min_grip, max_grip, min_j2, max_j2, min_j3, max_j3)
+
+            # ── Full chunk debug tracking ──
+            _raw_chunk_debug = []                 # list of per-action dicts for all chunks
+            _raw_chunk_csv_path = None
+            _raw_chunk_csv_fh = None
+            _raw_chunk_json_path = None
+            # ── Gripper gate per-step tracking ──
+            _gripper_gate_log = []                # (step, raw, after_denorm, after_clamp, after_safety, final)
+            # ── Dual close/lift detection ──
+            _raw_chunk_close_detected = False
+            _final_command_close_detected = False
+            _first_raw_close_idx = -1
+            _first_final_close_idx = -1
+            _first_raw_lift_idx = -1
+            _first_final_lift_idx = -1
+            _raw_chunk_j2_max = -999.0
+            _final_j2_max = -999.0
+            _raw_chunk_grip_min = 999.0
+            _final_grip_min = 999.0
+            _stagnation_trigger_step = -1
+            _stagnation_allowed = True
+            _executed_chunk_indices = set()
+            _max_executed_chunk_idx = -1
+            _drain_first_chunk_done = False       # for --debug-drain-first-chunk
+
+            # ── Setup chunk debug output files ──
+            if rollout_dir is not None:
+                _raw_chunk_csv_path = rollout_dir / "raw_chunk_debug.csv"
+                try:
+                    _raw_chunk_csv_fh = open(str(_raw_chunk_csv_path), "w", encoding="utf-8")
+                    _raw_chunk_csv_fh.write(
+                        "step,chunk_id,chunk_idx,action_idx_in_chunk,"
+                        "raw_j1,raw_j2,raw_j3,raw_j4,raw_j5,raw_j6,raw_gripper,"
+                        "post_j1,post_j2,post_j3,post_j4,post_j5,post_j6,post_gripper,"
+                        "gated_j1,gated_j2,gated_j3,gated_j4,gated_j5,gated_j6,gated_gripper,"
+                        "final_j1,final_j2,final_j3,final_j4,final_j5,final_j6,final_gripper,"
+                        "was_gripper_forced_open,was_clamped,clamp_reason,phase,executed\n"
+                    )
+                except OSError as e:
+                    print(f"  [WARN] Could not open raw_chunk_debug.csv: {e}")
+                    _raw_chunk_csv_fh = None
+                _raw_chunk_json_path = rollout_dir / "raw_chunk_debug.json"
 
             for step in range(approach_steps):
                 loop_start = time.time()
@@ -2163,12 +2517,19 @@ def main():
                         else:
                             continue
                         using_held_last = False
-                    elif use_chunk_exec:
-                        # ── Chunk execution mode (hold_last_until_ready / target_reached) ──
+                    elif use_chunk_exec or args.debug_drain_first_chunk:
+                        # ── Chunk execution mode (hold_last_until_ready / target_reached / drain) ──
+                        _drain_mode = args.debug_drain_first_chunk
+                        # In drain mode, force dry-run unless --allow-hardware-action
+                        if _drain_mode and not args.allow_hardware_action:
+                            args.dry_run = True
                         need_new_chunk = (
                             act_chunk is None
-                            or (chunk_idx >= len(act_chunk) and not hold_last_mode)
+                            or (chunk_idx >= len(act_chunk) and not hold_last_mode and not _drain_mode)
                         )
+                        # Drain mode: never re-query after first chunk
+                        if _drain_mode and _drain_first_chunk_done:
+                            need_new_chunk = False
                         if need_new_chunk:
                             with torch.inference_mode():
                                 normalized_obs = preprocessor(obs)
@@ -2220,7 +2581,53 @@ def main():
                                 print(f"          boundary_jump (L2, J1-J6): {_chunk_jump:.4f} rad"
                                       f"{' *** LARGE JUMP ***' if _chunk_jump > 0.1 else ''}")
 
-                        if hold_last_mode:
+                            # ── Raw chunk debug: save full chunk ──
+                            _raw_chunk_copy = act_chunk.copy()  # (chunk_size, 7)
+                            _raw_chunk_debug.append({
+                                "chunk_id": chunk_id,
+                                "chunk_size": len(act_chunk),
+                                "raw_chunk": _raw_chunk_copy,
+                            })
+                            # Raw chunk close/lift detection
+                            _raw_grip_close_thresh = (act_full_gripper_open + GRIPPER_CLOSE) / 2.0
+                            _raw_j2_lift_thresh = 0.5  # J2 > 0.5 rad considered "lifting"
+                            for _ai in range(len(act_chunk)):
+                                if _raw_chunk_grip_min > act_chunk[_ai, 6]:
+                                    _raw_chunk_grip_min = float(act_chunk[_ai, 6])
+                                if _raw_chunk_j2_max < act_chunk[_ai, 1]:
+                                    _raw_chunk_j2_max = float(act_chunk[_ai, 1])
+                                if not _raw_chunk_close_detected and act_chunk[_ai, 6] < _raw_grip_close_thresh:
+                                    _raw_chunk_close_detected = True
+                                    _first_raw_close_idx = _ai
+                                if not _raw_chunk_close_detected and act_chunk[_ai, 1] > _raw_j2_lift_thresh:
+                                    _first_raw_lift_idx = _ai
+
+                            if _drain_mode:
+                                _drain_first_chunk_done = True
+                                print(f"  [DRAIN] First chunk captured ({len(act_chunk)} actions)."
+                                      f"  Executing all sequentially (dry-run={args.dry_run}).")
+
+                        if _drain_mode:
+                            # ── drain-first-chunk: sequential, no re-query ──
+                            # Only advance on policy ticks; hold current target on servo ticks
+                            if is_policy_tick:
+                                if chunk_idx < len(act_chunk):
+                                    model_action = act_chunk[chunk_idx].copy()
+                                    chunk_idx += 1
+                                else:
+                                    # All actions drained — stop
+                                    print(f"\n  [DRAIN] All {len(act_chunk)} chunk actions drained."
+                                          f"  Stopping (dry-run={args.dry_run}).")
+                                    stop_reason = "drain_complete"
+                                    break
+                            else:
+                                # Servo tick: re-use first action if not yet set, or stay on current
+                                if model_action is None and chunk_idx == 0 and act_chunk is not None:
+                                    model_action = act_chunk[0].copy()
+                                if chunk_idx >= len(act_chunk) and model_action is None:
+                                    stop_reason = "drain_complete"
+                                    break
+                        elif hold_last_mode:
                             # ── hold_last_until_ready ──
                             if chunk_idx < len(act_chunk):
                                 model_action = act_chunk[chunk_idx].copy()
@@ -2426,6 +2833,57 @@ def main():
                     else:
                         sent_target[6] = min(sent_target[6], _close_strong_threshold)
 
+                # ── Gripper gate per-step tracking ──
+                _gate_raw_grip = float(model_action[6])
+                _gate_after_denorm = float(raw_target[6])
+                _gate_after_clamp = float(clipped[6])
+                _gate_after_safety = float(grip_val)  # before close latch
+                _gate_final = float(sent_target[6])     # after close latch
+                _gate_was_forced_open = bool(force_gripper_open)
+                _gate_was_clamped = (_gate_raw_grip != _gate_final)
+                _gate_clamp_reason = ""
+                if _gate_was_clamped:
+                    reasons = []
+                    if force_gripper_open:
+                        reasons.append("force_open")
+                    if _gate_final != _gate_after_safety:
+                        reasons.append("close_latch")
+                    if wrist_frozen:
+                        reasons.append("wrist_frozen")
+                    _gate_clamp_reason = "+".join(reasons) if reasons else "clamp"
+                _gripper_gate_log.append((
+                    step, _gate_raw_grip, _gate_after_denorm, _gate_after_clamp,
+                    _gate_after_safety, _gate_final,
+                    _gate_was_forced_open, _gate_was_clamped, _gate_clamp_reason,
+                ))
+
+                # ── Dual close detection: raw vs final ──
+                _close_thresh_gate = (act_full_gripper_open + GRIPPER_CLOSE) / 2.0
+                _open_thresh_gate = act_full_gripper_open - 0.01
+                if not _final_command_close_detected and _gate_final < _close_thresh_gate:
+                    _final_command_close_detected = True
+                    _first_final_close_idx = step
+                if _gate_raw_grip < _close_thresh_gate and _gate_final > _open_thresh_gate:
+                    print(f"\n  [GATE-WARN] step={step+1}: Gripper close was predicted"
+                          f" (raw={_gate_raw_grip:.4f}) but overridden to open"
+                          f" (final={_gate_final:.4f})."
+                          f"  was_forced_open={_gate_was_forced_open}"
+                          f"  clamp_reason={_gate_clamp_reason or 'none'}")
+
+                # ── Track final J2/grip extremes ──
+                if _final_j2_max < float(sent_target[1]):
+                    _final_j2_max = float(sent_target[1])
+                if _final_grip_min > _gate_final:
+                    _final_grip_min = _gate_final
+                if _first_final_lift_idx < 0 and float(sent_target[1]) > 0.5:
+                    _first_final_lift_idx = step
+
+                # ── Track executed chunk indices ──
+                if use_chunk_exec and chunk_id > 0:
+                    _executed_chunk_indices.add(chunk_idx)
+                    if chunk_idx > _max_executed_chunk_idx:
+                        _max_executed_chunk_idx = chunk_idx
+
                 final_step = step + 1
                 final_target = sent_target.copy()
                 if use_chunk_exec:
@@ -2542,12 +3000,37 @@ def main():
                         stagnation_count += 1
                     else:
                         stagnation_count = 0
+                    # ── Stagnation gate ──
+                    _stagnation_blocked_by_min_steps = (step + 1) < args.min_steps_before_stagnation
+                    _stagnation_blocked_by_close = (
+                        args.disable_stagnation_before_close
+                        and full_e2e_phase_tracking
+                        and not close_detected
+                    )
+                    _stagnation_suppressed = _stagnation_blocked_by_min_steps or _stagnation_blocked_by_close
+                    _stagnation_allowed = not _stagnation_suppressed
                     if stagnation_count >= STAGNATION_STEPS:
-                        print(f"\n  [STOP] Stagnation: {STAGNATION_STEPS} consecutive steps"
-                              f" with state_diff < {STAGNATION_THRESHOLD} before 70% progress")
-                        print(f"    step={step+1}/{approach_steps}  state_diff={state_diff:.6f}")
-                        stop_reason = "stagnation"
-                        break
+                        if _stagnation_suppressed:
+                            # Log that stagnation would have fired but is suppressed
+                            if stagnation_count == STAGNATION_STEPS:
+                                _reasons = []
+                                if _stagnation_blocked_by_min_steps:
+                                    _reasons.append(f"step={step+1} < min_steps={args.min_steps_before_stagnation}")
+                                if _stagnation_blocked_by_close:
+                                    _reasons.append(f"close_detected=False (--disable-stagnation-before-close)")
+                                print(f"  [STAG-SUPPRESS] Stagnation suppressed: {'; '.join(_reasons)}."
+                                      f"  state_diff={state_diff:.6f}  count={stagnation_count}")
+                            stagnation_count = 0  # reset to avoid repeated suppression messages
+                        else:
+                            _stagnation_trigger_step = step + 1
+                            print(f"\n  [STOP] Stagnation: {STAGNATION_STEPS} consecutive steps"
+                                  f" with state_diff < {STAGNATION_THRESHOLD} before 70% progress")
+                            print(f"    step={step+1}/{approach_steps}  state_diff={state_diff:.6f}")
+                            print(f"    min_steps_before_stag={args.min_steps_before_stagnation}"
+                                  f"  disable_before_close={args.disable_stagnation_before_close}"
+                                  f"  close_detected={close_detected}")
+                            stop_reason = "stagnation"
+                            break
 
                 # ── Full-E2E phase stop (act-full only) ──
                 if full_e2e_phase_tracking:
@@ -2615,6 +3098,15 @@ def main():
                     if _pred_grip < _grip_mid and _first_close_candidate_step < 0:
                         _first_close_candidate_step = step
                     _interp_alpha = 0.0 if is_policy_tick else (servo_substep / _servo_ratio)
+                    # Gripper gate values for this step (from tracking list)
+                    if _gripper_gate_log and _gripper_gate_log[-1][0] == step:
+                        _gg = _gripper_gate_log[-1]
+                        _gate_csv = (f"{_gg[1]:.6f},{_gg[2]:.6f},{_gg[3]:.6f},{_gg[4]:.6f},{_gg[5]:.6f},"
+                                     f"{_gg[6]},{_gg[7]},{_gg[8]},"
+                                     f"{_raw_chunk_close_detected},{_final_command_close_detected},{_stagnation_suppressed}")
+                    else:
+                        _gate_csv = f"{_pred_grip:.6f},{_pred_grip:.6f},{_pred_grip:.6f},{_pred_grip:.6f},{_pred_grip:.6f}," \
+                                    f"False,False,,{_raw_chunk_close_detected},{_final_command_close_detected},{_stagnation_suppressed}"
                     _csv_row = (
                         f"{step},{chunk_id},{chunk_idx},{servo_substep},{_interp_alpha:.3f},"
                         + ",".join(f"{robot_state_arr[j]:.6f}" for j in range(7))
@@ -2624,11 +3116,35 @@ def main():
                         + ",".join(f"{sent_target[j]:.6f}" for j in range(7))
                         + f",{_pred_grip:.6f},{_grip_fb:.6f},{close_detected},{gripper_phase},"
                         f"{arm_error < args.act_full_target_tol if use_chunk_exec and args.act_full_chunk_exec == 'target_reached' else 'N/A'},"
-                        f"{arm_error_active:.6f},{_wrist_is_frozen}\n"
+                        f"{arm_error_active:.6f},{_wrist_is_frozen},"
+                        f"{_gate_csv}\n"
                     )
                     if _csv_fh is not None:
                         _csv_fh.write(_csv_row)
                         _csv_fh.flush()
+
+                    # ── Raw chunk debug CSV ──
+                    if _raw_chunk_csv_fh is not None and act_chunk is not None:
+                        _action_idx = min(chunk_idx, len(act_chunk) - 1)
+                        _rc_action = act_chunk[_action_idx]
+                        _rc_clamped = clipped.copy() if 'clipped' in dir() else _rc_action
+                        _rc_gated = np.concatenate([smoothed_arm, [grip_val]])
+                        _rc_final = sent_target.copy()
+                        _rc_phase = gripper_phase if full_e2e_phase_tracking else "N/A"
+                        _rc_clamp_reason = _gate_clamp_reason if _gripper_gate_log and _gripper_gate_log[-1][0] == step else ""
+                        _rc_row = (
+                            f"{step},{chunk_id},{chunk_idx},{_action_idx},"
+                            + ",".join(f"{_rc_action[j]:.6f}" for j in range(7))
+                            + ","
+                            + ",".join(f"{_rc_clamped[j]:.6f}" for j in range(7))
+                            + ","
+                            + ",".join(f"{_rc_gated[j]:.6f}" for j in range(7))
+                            + ","
+                            + ",".join(f"{_rc_final[j]:.6f}" for j in range(7))
+                            + f",{_gate_was_forced_open},{_gate_was_clamped},{_rc_clamp_reason},{_rc_phase},true\n"
+                        )
+                        _raw_chunk_csv_fh.write(_rc_row)
+                        _raw_chunk_csv_fh.flush()
 
                 # ── Save rollout data ──
                 if args.save_rollout and rollout_dir is not None and (
@@ -2786,10 +3302,62 @@ def main():
                     "joint_ready": joint_ready,
                     "visual_alignment_required": True,
                     "user_note": "",
+                    # ── New summary fields ──
+                    "raw_close_detected": bool(_raw_chunk_close_detected),
+                    "final_close_detected": bool(_final_command_close_detected),
+                    "raw_lift_detected": bool(_first_raw_lift_idx >= 0),
+                    "final_lift_detected": bool(_first_final_lift_idx >= 0),
+                    "first_raw_close_idx": int(_first_raw_close_idx),
+                    "first_final_close_idx": int(_first_final_close_idx),
+                    "first_raw_lift_idx": int(_first_raw_lift_idx),
+                    "first_final_lift_idx": int(_first_final_lift_idx),
+                    "stagnation_trigger_step": int(_stagnation_trigger_step),
+                    "stagnation_allowed": bool(_stagnation_allowed),
+                    "executed_chunk_indices": sorted(list(_executed_chunk_indices)),
+                    "max_executed_chunk_idx": int(_max_executed_chunk_idx),
+                    "max_raw_J2": float(_raw_chunk_j2_max),
+                    "max_final_J2": float(_final_j2_max),
+                    "min_raw_gripper": float(_raw_chunk_grip_min),
+                    "min_final_gripper": float(_final_grip_min),
+                    "total_chunks_generated": int(_total_chunks_generated),
+                    "chunk_history": [
+                        {"chunk_id": cid, "grip_min": gmin, "grip_max": gmax,
+                         "j2_min": j2min, "j2_max": j2max, "j3_min": j3min, "j3_max": j3max}
+                        for cid, gmin, gmax, j2min, j2max, j3min, j3max in _chunk_history
+                    ],
                 }
                 debug_path = rollout_dir / "approach_alignment_debug.json"
                 debug_path.write_text(json.dumps(debug_payload, indent=2), encoding="utf-8")
                 print(f"  Saved approach alignment debug JSON: {debug_path}")
+
+                # ── Save raw chunk debug JSON ──
+                if _raw_chunk_debug:
+                    _rc_json = {
+                        "num_chunks": len(_raw_chunk_debug),
+                        "chunks": [],
+                        "gripper_gate_log": [
+                            {"step": s, "raw": r, "after_denorm": d, "after_clamp": c,
+                             "after_safety": a, "final": f,
+                             "was_forced_open": fo, "was_clamped": wc, "clamp_reason": cr}
+                            for s, r, d, c, a, f, fo, wc, cr in _gripper_gate_log
+                        ],
+                    }
+                    for _rc_entry in _raw_chunk_debug:
+                        _rc_json["chunks"].append({
+                            "chunk_id": _rc_entry["chunk_id"],
+                            "chunk_size": _rc_entry["chunk_size"],
+                            "raw_chunk": to_jsonable(_rc_entry["raw_chunk"]),
+                        })
+                    _raw_chunk_json_path = rollout_dir / "raw_chunk_debug.json"
+                    _raw_chunk_json_path.write_text(json.dumps(_rc_json, indent=2), encoding="utf-8")
+                    print(f"  Saved raw chunk debug JSON: {_raw_chunk_json_path}")
+
+                # ── Only-first-few-actions warning ──
+                if _max_executed_chunk_idx >= 0 and _max_executed_chunk_idx <= 2 and _total_chunks_generated >= 1:
+                    print(f"\n  [WARN] Only first few actions of chunk were executed"
+                          f" (max_executed_chunk_idx={_max_executed_chunk_idx}).")
+                    print(f"  Later close/lift actions were never reached."
+                          f"  Consider --debug-drain-first-chunk to verify chunk contents.")
                 print("  Please inspect final_realsense.png and final_usb.png:")
                 print("    - Is the gripper center aligned with the cube center?")
                 print("    - Is the approach height correct?")
@@ -2813,6 +3381,25 @@ def main():
                       f"{' (NONE)' if _first_close_candidate_step < 0 else ''}")
                 print(f"    close_detected         : {close_detected} (step={close_step})")
                 print(f"    strong_close_detected  : {strong_close_detected}")
+                # ── New dual close/lift detection ──
+                print(f"    raw_chunk_close_detected     : {_raw_chunk_close_detected}"
+                      f"  (first_idx={_first_raw_close_idx})")
+                print(f"    final_command_close_detected : {_final_command_close_detected}"
+                      f"  (first_idx={_first_final_close_idx})")
+                if _raw_chunk_close_detected and not _final_command_close_detected:
+                    print(f"    [WARN] Model predicted close in raw chunk, but deployment pipeline"
+                          f" removed or did not execute it.")
+                print(f"    first_raw_lift_idx    : {_first_raw_lift_idx}")
+                print(f"    first_final_lift_idx  : {_first_final_lift_idx}")
+                print(f"    max_raw_J2            : {_raw_chunk_j2_max:.4f}")
+                print(f"    max_final_J2          : {_final_j2_max:.4f}")
+                print(f"    min_raw_gripper       : {_raw_chunk_grip_min:.5f}")
+                print(f"    min_final_gripper     : {_final_grip_min:.5f}")
+                print(f"    stagnation_trigger    : step={_stagnation_trigger_step}"
+                      f"  allowed={_stagnation_allowed}")
+                print(f"    stop_reason           : {stop_reason}")
+                print(f"    executed_chunk_indices: {sorted(list(_executed_chunk_indices))}")
+                print(f"    max_executed_chunk_idx: {_max_executed_chunk_idx}")
                 print(f"    Final raw action       : {fmt_vec(raw_actions[-1], 5)}" if raw_actions else "    No raw actions")
                 print(f"    Final target qpos      : {fmt_vec(final_target, 5)}" if final_target is not None else "    No final target")
                 if _chunk_history:
@@ -2825,12 +3412,26 @@ def main():
                 if args.enable_act_queue_smoothing:
                     print(f"    Smoothing: blend={args.act_boundary_blend_steps}  ma={args.act_mean_filter_window}"
                           f"  arm_only={args.smooth_arm_only}")
+                # ── Gripper gate summary ──
+                if _gripper_gate_log:
+                    _raw_closes = [(s, r) for s, r, d, c, a, f, fo, wc, cr in _gripper_gate_log if r < _grip_mid_summary]
+                    _final_closes = [(s, f) for s, r, d, c, a, f, fo, wc, cr in _gripper_gate_log if f < _grip_mid_summary]
+                    _overrides = [(s, r, f) for s, r, d, c, a, f, fo, wc, cr in _gripper_gate_log
+                                  if r < _grip_mid_summary and f > act_full_gripper_open - 0.01]
+                    print(f"    Gripper gate: {len(_raw_closes)} raw_closes, {len(_final_closes)} final_closes,"
+                          f" {len(_overrides)} overrides")
+                    if _overrides:
+                        for s, r, f in _overrides[:5]:
+                            print(f"      step={s+1}: raw={r:.4f} -> final={f:.4f} OVERRIDE")
                 print(f"  {'─' * 40}")
 
-            # Close CSV file (always, regardless of phase tracking)
+            # Close CSV files (always, regardless of phase tracking)
             if _csv_fh is not None:
                 _csv_fh.close()
                 _csv_fh = None
+            if _raw_chunk_csv_fh is not None:
+                _raw_chunk_csv_fh.close()
+                _raw_chunk_csv_fh = None
 
             # ================================================================
             #  TEST MODE A: approach only — done
