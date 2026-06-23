@@ -1,247 +1,163 @@
-# Piper ACT Bottle Grasp
+# Piper ACT Cube Grasp
 
-基于 Piper 双臂（镜像模式）+ ACT 算法的瓶子抓取项目。
+End-to-end visuomotor cube grasping on the Piper 7-DoF arm, trained with [ACT](https://github.com/tonyzhaozh/act) (Action Chunking Transformer) via [LeRobot](https://github.com/huggingface/lerobot).
 
-## 最终成功展示
+Dual-camera (wrist RealSense D435i + overhead USB), 64 demonstrations, 4 cube positions (2 colors × 2 rotations).
 
-ACT 策略在 64 条双摄像头示教数据上训练后，成功在不同位置抓取方块。以下展示对角位置（蓝色 R0 + 紫色 R90）的完整抓取过程，每条均包含全局视角和腕部视角。
+## Results
 
-<table>
-<tr>
-<td align="center"><b>Blue Block R0</b></td>
-<td align="center"><b>Purple Block R90</b></td>
-</tr>
-<tr>
-<td><img src="docs/demo_animations/ep0_blue_R0.gif" width="100%" /></td>
-<td><img src="docs/demo_animations/ep48_purple_R90.gif" width="100%" /></td>
-</tr>
-</table>
+ACT policy successfully grasps cubes at all four positions after 100K training steps (ResNet-18 backbone, chunk size 100, 2× image augmentation).
 
-> 上方为全局视角（Global View），下方为腕部视角（Wrist View）。2x 加速播放。训练配置：ACT ResNet18，100K 步，64 条双摄示教数据。
+<p align="center">
+  <img src="docs/demo_animations/ep0_blue_R0.gif" width="45%" />
+  <img src="docs/demo_animations/ep48_purple_R90.gif" width="45%" />
+</p>
 
-## 硬件配置
+*Top: Global View (overhead USB camera). Bottom: Wrist View (RealSense D435i). 2× speed. Blue block R0° (left) and purple block R90° (right) — diagonal positions in the task grid.*
 
-| 组件 | 型号 | 连接方式 | 用途 |
-|---|---|---|---|
-| 被控臂 | Piper | CAN (can0) | 执行抓取动作 |
-| 示教臂 | Piper | 同一条 CAN 总线 | 人手拖动，被控臂自动镜像跟随 |
-| 腕部相机 | RealSense D435i | USB 3.0 | 末端 RGB |
-| 全局相机 | USB SN0002 | USB | 俯视 RGB |
-| GPU | NVIDIA RTX 3060 12GB | — | 训练 + 推理 |
+## Hardware
 
-> **镜像模式**：示教臂和被控臂共享同一条 CAN 总线（can0），由硬件层面自动完成镜像跟随，无需软件转发。采集时只需读取被控臂状态即可。
+| Component | Model | Connection |
+|---|---|---|
+| Robot arm | Piper 7-DoF | CAN bus (can0) |
+| Wrist camera | RealSense D435i | USB 3.0 |
+| Global camera | USB SN0002 | USB |
+| GPU | NVIDIA RTX 3060 12GB | PCIe |
+| Teaching arm | Piper (mirror mode) | Shared CAN bus (can0) |
 
-## 环境搭建
+> **Mirror mode**: both arms share the same CAN bus. The teaching arm's motion is mirrored at the hardware level — no software forwarding needed. Data collection reads the follower arm state directly.
 
-### 1. Conda 环境
+## Setup
+
+### Conda environment
 
 ```bash
-conda create -n piper_act python=3.10 -y
-conda activate piper_act
+conda create -n lerobot_q python=3.10 -y
+conda activate lerobot_q
 pip install -r requirements.txt
 ```
 
-关键依赖：
-- `lerobot >= 0.5.2`（本项目使用 `/home/huatec/third_party/lerobot` 的 editable 安装）
-- `torch >= 2.0`（CUDA 版）
-- `pyrealsense2`（RealSense 相机）
-- `opencv-python`（图像处理）
-- `numpy < 2.0`（避免与 cv2 的 NumPy ABI 冲突）
+Key dependencies: `lerobot >= 0.5.2`, `torch >= 2.0` (CUDA), `pyrealsense2`, `opencv-python`, `numpy < 2.0`.
 
-### 2. Conda 环境隔离（重要）
-
-如果系统安装了 ROS2，PYTHONPATH 会污染 conda 环境。已在 `~/miniconda3/envs/piper_act/etc/conda/` 下配置了自动 hooks：
-- `activate.d/unset_pythonpath.sh` — 激活环境时自动清空 PYTHONPATH
-- `deactivate.d/restore_pythonpath.sh` — 退出环境时恢复
-
-### 3. CAN 总线
+### CAN bus
 
 ```bash
-# 只需要 can0（示教臂和被控臂共享同一 CAN 总线）
-sudo ip link set can0 down 2>/dev/null; sudo ip link set can0 up type can bitrate 1000000
-
-# 或者用脚本
 sudo bash scripts/setup_can.sh
+# or manually:
+sudo ip link set can0 down 2>/dev/null
+sudo ip link set can0 up type can bitrate 1000000
 ```
 
-## 项目结构
+### ROS 2 bridge (optional)
+
+For the ROS → SDK bridge, source the ROS 2 workspace before launching:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/huatec/piper_py_ws/install/setup.bash
+python3 launch/ros_sdk_bridge.launch.py allow_real_read:=true allow_real_write:=true
+```
+
+## Project structure
 
 ```
-├── README.md
-├── requirements.txt
-├── config/
-│   └── default.yaml              # 参考配置
-│
-├── test_hardware.py              # 硬件链路验证（6 步自检）
-├── hardware/
-│   └── piper_wrapper.py          # Piper SDK 高层封装（安全限位、指令下发）
-├── camera/
-│   └── rs_camera.py              # RealSense D435i + USB 相机驱动（自动扫描）
-│
-├── teleop/
-│   └── data_collector.py         # 示教数据采集（LeRobot v3.0 格式）
-│
-├── training/
-│   └── train.sh                  # ACT 训练启动脚本
-│
+├── camera/                  RealSense D435i + USB camera driver (auto-detect)
+├── hardware/                Piper SDK wrapper (safety limits, joint commands)
+├── teleop/                  Data collection (LeRobot v3.0 format)
+├── training/                ACT training scripts
 ├── inference/
-│   ├── deploy.py                 # 真机推理部署
-│   └── eval.py                   # 离线评估（计算 MSE，不需要机械臂）
-│
-├── scripts/
-│   ├── setup_can.sh              # CAN 双通道配置
-│   └── setup_env.sh              # venv 环境安装脚本
-│
+│   ├── deploy.py            Real-robot deployment (approach + grasp pipeline)
+│   └── eval_official_act.py Offline evaluation (MSE, per-episode)
+├── ros_bridge/              ROS 2 bridge nodes (SDK → ROS topics → SDK)
+├── launch/                  ROS 2 launch files
+├── scripts/                 Utility scripts (CAN setup, camera preview, dataset prep)
+├── configs/                 Training configs (official ACT, cube_64_dual)
 ├── data/
-│   └── lerobot_dataset/          # 采集的 LeRobot v3.0 数据集
-├── outputs/                      # 训练输出
-│   └── train/
-│       └── piper_bottle_grasp/
-│           └── checkpoints/
-│               ├── step_020000/  # 各步数 checkpoint
-│               └── last/         # → 指向最新 checkpoint 的软链接
-│
-└── piper_sdk_py_driver/          # Piper SDK 驱动（外部提供）
+│   ├── cube_64_dual/        64-episode dual-cam dataset (167 MB)
+│   └── single_cube_line4pos_40_clean/  40-episode single-cam dataset (124 MB)
+├── outputs/train/           Training outputs & checkpoints
+└── docs/                    Documentation & demo animations
 ```
 
-## 完整工作流
+## Workflow
 
-> 详细的逐步操作指南请阅读 **[docs/workflow.md](docs/workflow.md)**，包含每一步的预期输出、故障排查和操作细节。以下为快速概览。
->
-> ACT 静止帧、裁剪对齐、chunk size 和 checkpoint 排查请阅读 **[docs/act_debugging.md](docs/act_debugging.md)**。
-
-### Step 1 — 验证硬件
+### 1. Verify hardware
 
 ```bash
-conda activate piper_act
-python3 test_hardware.py                # 机械臂 6 步自检
-python3 teleop/data_collector.py --list-cameras  # 列出相机
-python3 teleop/data_collector.py --camera-only --global-camera auto  # 测试画面
+conda activate lerobot_q
+python3 teleop/data_collector.py --list-cameras
+bash scripts/view_cameras.sh          # dual-camera preview
 ```
 
-### Step 2 — 采集示教数据
+### 2. Collect demonstrations
 
 ```bash
-conda activate piper_act
 python3 teleop/data_collector.py --global-camera auto
 ```
 
-| 按键 | 功能 |
+| Key | Function |
 |---|---|
-| E | 使能被控臂 |
-| 空格 | 开始/停止录制 |
-| R | 丢弃当前条重录 |
-| Q | 退出 |
+| `E` | Enable follower arm |
+| `Space` | Start / stop recording |
+| `R` | Discard current episode |
+| `Q` | Quit |
 
-> 每条数据开始前，手动把示教臂和被控臂一起回到固定起点，再按空格录制。建议采集 **50-100 条**，变化瓶子位置和角度。详见 [docs/workflow.md](docs/workflow.md) 第二步。
+Manually return both arms to the start pose before each episode. Collect 15–20 episodes per cube position.
 
-### Step 3 — 训练 ACT 模型
-
-```bash
-conda activate piper_act
-nohup bash training/train.sh > /tmp/train_piper_act.log 2>&1 &   # 后台训练
-tail -f /tmp/train_piper_act.log   # 监控
-```
-
-训练超参见 [training/train.sh](training/train.sh)，checkpoint 保存在 `outputs/train/piper_bottle_grasp/checkpoints/`。
-
-### Step 4 — 离线评估
+### 3. Train
 
 ```bash
-python3 inference/eval.py \
-    --checkpt outputs/train/piper_bottle_grasp/checkpoints/last/pretrained_model
+# 64-episode dual-cam dataset (ResNet-18, d=256, chunk=100, 100K steps)
+bash scripts/run_cube_blue_r0_d256.sh
+
+# Official ACT on 40-episode single-cam dataset
+bash training/train_official_act_single_cube_40.sh
 ```
 
-逐帧对比预测 vs 真值，输出 MSE。不需要机械臂。
+Training configs are in `configs/`. Checkpoints are saved to `outputs/train/`.
 
-### Step 5 — 真机部署
+### 4. Offline evaluation
 
 ```bash
-python3 inference/deploy.py \
-    --checkpt outputs/train/piper_bottle_grasp/checkpoints/last/pretrained_model
+python3 inference/eval_official_act.py \
+    --checkpt outputs/train/act_cube_64_dual_d256/checkpoints/100000/pretrained_model
 ```
 
-按**空格**执行一次抓取。可选 `--velocity-pct 30` 调低速度更安全。
+### 5. Deploy on real robot
 
-调试“抬不起来 / 抬一下停住”时建议先用：
+```bash
+# Full end-to-end (approach, close, lift, release)
+bash scripts/run_official_act_full.sh
+```
+
+Or directly:
 
 ```bash
 python3 inference/deploy.py \
-    --checkpt outputs/train/piper_bottle_grasp/checkpoints/020000/pretrained_model \
-    --debug-actions \
-    --debug-every 1 \
-    --replan-every-step
+    --policy-type act-full \
+    --checkpt outputs/train/act_cube_64_dual_d256/checkpoints/100000/pretrained_model \
+    --control-backend direct_sdk \
+    --test-mode full-e2e \
+    --allow-real-full-e2e
 ```
 
-完整数据诊断、重建式裁剪、chunk size 对照训练和 checkpoint 批量评估命令见 [docs/act_debugging.md](docs/act_debugging.md)。
+Press `Space` to execute one grasp attempt. `Q` to quit.
 
-如果离线检查发现策略输出固定姿势，优先走 [delta action + phase input](docs/act_debugging.md#35-修复坍缩delta-action--phase-input) 流程；这类 checkpoint 部署时要加 `--action-mode delta`。
+## Deployment safety
 
-## 已知问题与修复
+The `direct_sdk` backend has per-step delta limits, joint limits, stagnation detection, and norm safety flooring. All deployments require explicit `--allow-real-full-e2e`.
 
-### 1. lerobot 源码 patch
+The ROS bridge path adds a secondary safety layer:
+- `safety_gate_node` — validates & clips every raw action against joint/delta limits
+- `piper_sdk_command_node` — applies configurable command scaling (default 20%), cumulative displacement guards, and oscillation detection
+- All real-hardware flags (`--allow-real-read`, `--allow-real-write`, `--confirm-real-write`) default OFF
 
-本项目使用的 lerobot v0.5.2 有一处 bug 已在本机修复：
+## Known fixes
 
-**文件**：`~/third_party/lerobot/src/lerobot/utils/feature_utils.py:153`
+- **LeRobot `feature_utils.py` patch** (v0.5.2): `ft["names"]` → `ft.get("names")` at line 153 of `lerobot/utils/feature_utils.py`. Video features in LeRobotDataset v3.0 lack a `names` field, causing training to crash.
+- **NumPy < 2.0 required**: OpenCV is compiled against NumPy 1.x ABI. Install with `pip install "numpy<2"`.
+- **PYTHONPATH isolation**: ROS 2's system Python path conflicts with conda. The conda env has activate/deactivate hooks in `~/miniconda3/envs/lerobot_q/etc/conda/` to clean PYTHONPATH.
 
-**问题**：LeRobotDataset v3.0 中 video 类型的数据没有 `names` 字段，但 `dataset_to_policy_features` 假设它存在，导致训练启动时崩溃。
+## Citation
 
-**修复**：将 `ft["names"]` 改为 `ft.get("names")`，并在后续检查中加入空值保护：
-```python
-names = ft.get("names")
-if names and names[2] in ["channel", "channels"]:
-    shape = (shape[2], shape[0], shape[1])
-```
-
-如果重装 lerobot 或换机器，需要重新打这个 patch。
-
-### 2. NumPy 版本
-
-`numpy<2.0` 是必须的。OpenCV 的 Python 包编译时链接了 NumPy 1.x ABI，用 NumPy 2.x 会报 `_ARRAY_API` 错误。
-
-如果出现此错误：
-```bash
-pip install "numpy<2" --force-reinstall opencv-python
-```
-
-### 3. PYTHONPATH 污染
-
-如果系统有 ROS2，激活 conda 环境后系统 Python 包可能被加载。已在 conda hooks 中处理，如果换了环境需要重新配置。
-
-### 4. USB 摄像头无法打开
-
-SN0002 摄像头在某些系统上 V4L2 打开失败。已实现自动扫描 `/dev/video*` 设备并逐个尝试。可以用 `--list-cameras` 先列出所有设备，再用 `--global-camera N` 指定具体设备号。
-
-## SDK API 速查
-
-`PiperRobot`（`hardware/piper_wrapper.py`）：
-
-| 方法 | 返回值 | 说明 |
-|---|---|---|
-| `connect()` | — | 连接 CAN |
-| `enable(blocking=True)` | — | 使能电机（阻塞直到完成） |
-| `disable()` | — | 失能电机 |
-| `get_joint_positions()` | `list[float]` × 7 | 读取 [j1..j6, gripper]，单位 rad / m |
-| `get_joint_state()` | `JointState` | 位置 + 速度 + 力矩 |
-| `get_end_pose()` | `EndPose` | 末端位姿 (x, y, z, rx, ry, rz) |
-| `set_joint_positions(pos, velocity_pct)` | — | 下发关节指令 |
-| `disconnect()` | — | 断开 CAN 连接 |
-
-底层基于 `piper_sdk.C_PiperInterface`，关节角单位 rad，夹爪单位 m。安全限位 ±3.14 rad，夹爪范围 0~0.10 m。
-
-## 眼镜哥接手注意事项
-
-1. **环境位置**：conda 环境在 `~/miniconda3/envs/piper_act/`，可编辑安装的 lerobot 在 `~/third_party/lerobot/`
-2. **CAN 线**：示教臂和被控臂共享同一 CAN 总线（can0），只需要一根 CAN 线同时连接两个臂
-3. **数据采集**：拖动示教臂 → 被控臂自动跟随 → 程序读取被控臂状态 + 摄像头 → 保存为 LeRobot 格式
-4. **起始位姿**：不要让程序自动回位；每条开始前手动把示教臂和被控臂一起回到固定起点
-5. **训练监控**：`tail -f /tmp/train_piper_act.log`
-6. **checkpoint 路径**：用 `checkpoints/last/pretrained_model` 软链接，始终指向最新 checkpoint
-7. **换机器需要做的事**：
-   - 装 conda 环境 + 依赖
-   - 装 lerobot（`pip install -e ~/third_party/lerobot`）
-   - 打上面提到的 `feature_utils.py` patch
-   - 配置 conda hooks（PYTHONPATH 隔离）
-   - 装 pyrealsense2 + OpenCV
-   - 配置 CAN 总线
+Built on [LeRobot](https://github.com/huggingface/lerobot) and [ACT](https://github.com/tonyzhaozh/act).
